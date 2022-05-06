@@ -1,0 +1,3748 @@
+---
+title: "Investigating the causal risk factors for self-harm by integrating Mendelian randomisation within twin modelling"
+author: "Kai Lim"
+date: "03/05/2022"
+output: 
+  html_document: 
+    code_folding: show
+    toc: true
+    toc_depth: 3
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction
+This is an RMarkdown document to record the steps taken to obtain the results for the MR-DoC project. We will first prepare the data.
+
+## Setting up
+Load libraries and data wrangling
+
+```{r setup and housekeeping,warning = FALSE, message = FALSE}
+rm(list=ls())
+path<-"/Users/kai/OneDrive - King's College London/PhD/MR_DOC/data/486 Kai Lim self harm aetiology 030920.sav"
+Sys.setenv(OMP_NUM_THREADS=parallel::detectCores()) #this has to be before loading the library OpenMx
+
+library(foreign)
+library(data.table)
+library(OpenMx)
+library(tidyverse)
+library(reshape2)
+library(kableExtra)
+library(rqdatatable)
+library(fmsb)
+library(MASS)
+library(plyr)
+library(gee)
+library(fastDummies)
+mxOption(NULL, "Default optimizer", "SLSQP") # SLSQP is a better optimizer for ordinal data
+
+##### [/] read data and data cleaning #####
+self_harm_data_c<-read.spss(path,verbose=T,to.data.frame = T)
+
+# recode factors as numerics for self-harm measures so that it's easier to recode "no" to zero 
+SH_index<-c("u1cslfh021","u1cslfh022","u1cslfh031","u1cslfh032","u1cslfh041","u1cslfh042")
+self_harm_data_c[,SH_index]<-mutate_if(self_harm_data_c[,c(SH_index)],is.factor,as.numeric)#import as numeric values for all columns
+
+#recode so that no="0"
+self_harm_data_c$u1cslfh021=self_harm_data_c$u1cslfh021-1
+self_harm_data_c$u1cslfh022=self_harm_data_c$u1cslfh022-1
+self_harm_data_c$u1cslfh031=self_harm_data_c$u1cslfh031-1
+self_harm_data_c$u1cslfh032=self_harm_data_c$u1cslfh032-1
+self_harm_data_c$u1cslfh041=self_harm_data_c$u1cslfh041-1
+self_harm_data_c$u1cslfh042=self_harm_data_c$u1cslfh042-1
+
+
+#bring zeros from SH question into NSSH and SSH.
+self_harm_data_c <- mutate(self_harm_data_c, 
+                           NSSH1 = ifelse(is.na(u1cslfh031)&u1cslfh021==0,
+                                          u1cslfh021,u1cslfh031)) 
+self_harm_data_c <- mutate(self_harm_data_c, 
+                           NSSH2 = ifelse(is.na(u1cslfh032)&u1cslfh022==0,
+                                          u1cslfh022,u1cslfh032))
+self_harm_data_c <- mutate(self_harm_data_c, 
+                           SSH1 = ifelse(is.na(u1cslfh041)&u1cslfh021==0,
+                                         u1cslfh021,u1cslfh041)) 
+self_harm_data_c <- mutate(self_harm_data_c, 
+                           SSH2 = ifelse(is.na(u1cslfh042)&u1cslfh022==0,
+                                         u1cslfh022,u1cslfh042))
+
+
+#reverse code TEPS (hedonia) into anhedonia
+self_harm_data_c$pcbhtepstr_1=50-self_harm_data_c$pcbhtepst1
+self_harm_data_c$pcbhtepstr_2=50-self_harm_data_c$pcbhtepst2
+```
+
+## Data preparation: PRS
+Now we prepare the data for polygenic scoring analyses by giving shorter column names for the polygenic scores
+```{r prs-prepare}
+
+#add new columns for multiple PRS, easier names
+self_harm_data_c[c("SCZ001"  , "SCZ030"  , "SCZ100", 
+                   "ADHD001" , "ADHD030" , "ADHD100",
+                   "MDD001"  , "MDD030"  , "MDD100", 
+                   "INSOM001", "INSOM030", "INSOM100")]<-
+  self_harm_data_c[c("SCZ_Pardinas2018_FRCT0.01", 
+                     "SCZ_Pardinas2018_FRCT0.3",
+                     "SCZ_Pardinas2018_FRCT1",
+                     "ADHD_PGC2017_FRCT0.01", 
+                     "ADHD_PGC2017_FRCT0.3", 
+                     "ADHD_PGC2017_FRCT1",
+                     "MDD_excl23andme_PGC2018_FRCT0.01",
+                     "MDD_excl23andme_PGC2018_FRCT0.3",
+                     "MDD_excl23andme_PGC2018_FRCT1",
+                     "Insomnia_Hammerschlag2017_FRCT0.01",
+                     "Insomnia_Hammerschlag2017_FRCT0.3",
+                     "Insomnia_Hammerschlag2017_FRCT1")]
+```
+
+## Data preparation: twin modelling
+The code chunk below shows the data preparation steps taken for twin modelling. These steps were repeated in each twin modelling R script. 
+```{r prepare-twin-modelling}
+### fill in blanks for missing co-twin's age. 
+#fill in co-twin's age as proxy
+self_harm_data_c <- mutate(self_harm_data_c, 
+                           age1 = ifelse(is.na(u1cage1),
+                                         u1cage2 , u1cage1))
+self_harm_data_c <- mutate(self_harm_data_c, 
+                           age2 = ifelse(is.na(u1cage2),
+                                         u1cage1 , u1cage2))
+
+self_harm_data_c <- mutate(self_harm_data_c, 
+                           age_161 = ifelse(is.na(pcbhage1),
+                                            pcbhage2 , pcbhage1))
+self_harm_data_c <- mutate(self_harm_data_c, 
+                           age_162 = ifelse(is.na(pcbhage2),
+                                            pcbhage1 , pcbhage2))
+
+## regress out effect of PCs, chips for PRS, and standardise them.
+# the steps:
+# 1. regress out sex, age, PCs and chips 
+# 2. then standardise the PGS. Do this for all twins because not all twins within a pair were genotyped
+# which resulted in unequal sample size between t1 and t2. 
+
+#create a column for sex and age corresponding to the PRS columns
+self_harm_data_c<-mutate(self_harm_data_c, 
+                         PGS_sex=ifelse(genotyped1==1,sex1,
+                                 ifelse(genotyped1==0,NA,NA)))
+
+self_harm_data_c<-mutate(self_harm_data_c, 
+                         PGS_age=ifelse(genotyped1==1,age_161,
+                                 ifelse(genotyped1==0,NA,NA)))
+
+#regress out effects of batch, PCs, age and sex for MDD PRS
+self_harm_data_c$MDD100_res<- 
+  scale(residuals(lm(self_harm_data_c$MDD100~ 
+                       self_harm_data_c$Batch+     
+                       self_harm_data_c$PC1+
+                       self_harm_data_c$PC2+
+                       self_harm_data_c$PC3+
+                       self_harm_data_c$PC4+                
+                       self_harm_data_c$PC5+
+                       self_harm_data_c$PC6+
+                       self_harm_data_c$PC7+      
+                       self_harm_data_c$PC8+
+                       self_harm_data_c$PC9+
+                       self_harm_data_c$PC10+
+                       self_harm_data_c$PGS_sex+
+                       self_harm_data_c$PGS_age,
+                       na.action="na.exclude")))
+
+## same steps for ADHD
+self_harm_data_c$ADHD100_res<- 
+  scale(residuals(lm(self_harm_data_c$ADHD100~
+                       self_harm_data_c$Batch+ 
+                       self_harm_data_c$PC1+                                                
+                       self_harm_data_c$PC2+
+                       self_harm_data_c$PC3+
+                       self_harm_data_c$PC4+
+                       self_harm_data_c$PC5+
+                       self_harm_data_c$PC6+
+                       self_harm_data_c$PC7+
+                       self_harm_data_c$PC8+
+                       self_harm_data_c$PC9+
+                       self_harm_data_c$PC10+
+                       self_harm_data_c$PGS_sex+
+                       self_harm_data_c$PGS_age,
+                       na.action="na.exclude")))
+
+
+
+
+#### [/] make PRS data wide format so that twin modelling can be conducted ####
+# I referred to this website:
+# http://www.cookbook-r.com/Manipulating_data/Converting_data_between_wide_and_long_format/ 
+testdata<-self_harm_data_c[,c("randomtwinid", "twin","ADHD100_res", "MDD100_res")]
+
+for (id in seq(from=1,to=length(testdata[,"ADHD100_res"]),by=1))
+{if (testdata$twin[id]==1) 
+{ testdata$ADHD100_res_t1[id]<-testdata$ADHD100_res[id]
+testdata$ADHD100_res_t2[id]<-testdata$ADHD100_res[id+1]}
+  else if (testdata$twin[id]==2) 
+  {testdata$ADHD100_res_t1[id]<-testdata$ADHD100_res[id]
+  testdata$ADHD100_res_t2[id]<-testdata$ADHD100_res[id-1]}
+  else{print("something's wrong")}
+}
+
+
+for (id in seq(from=1,to=length(testdata[,"MDD100_res"]),by=1))
+{if (testdata$twin[id]==1) 
+{ testdata$MDD100_res_t1[id]<-testdata$MDD100_res[id]
+testdata$MDD100_res_t2[id]<-testdata$MDD100_res[id+1]}
+  else if (testdata$twin[id]==2) 
+  {testdata$MDD100_res_t1[id]<-testdata$MDD100_res[id]
+  testdata$MDD100_res_t2[id]<-testdata$MDD100_res[id-1]}
+  else{print("something's wrong")}
+}
+
+#merge the wide data for PRS with original dataset
+merged_data<-merge(self_harm_data_c,testdata[,c(1,5:8)],by=c("randomtwinid"))
+
+# let OpenMx know they are ordinal variables/factors
+merged_data$SH1<-mxFactor(merged_data$u1cslfh021, levels=c(0:4) )
+merged_data$SH2<-mxFactor(merged_data$u1cslfh022, levels=c(0:4) )
+merged_data$NSSH1<-mxFactor(merged_data$NSSH1, levels=c(0:4) )
+merged_data$NSSH2<-mxFactor(merged_data$NSSH2, levels=c(0:4) )
+merged_data$SSH1<-mxFactor(merged_data$SSH1, levels=c(0:4) )
+merged_data$SSH2<-mxFactor(merged_data$SSH2, levels=c(0:4) )
+```
+
+# Descriptive statistics
+Now the data prepraration has been done, we explore the descriptive statistics. The code chunks below were used to generate Table 1, Table S1 and Figure 1. 
+
+
+## Average age of twins
+We first calculate the mean age of twins at adolescence and young adulthood.
+```{r average age, results='hide'}
+ ## mean age for 21 yo
+psych::describe(merged_data$age1,na.rm=T) # 22.3 years, sd = 0.92, range = 4.73
+## mean age for 16 yo
+psych::describe(merged_data$age_162,na.rm=T) #16.3 years, sd=0.69, range = 6.43
+```
+
+At adolescence, the mean age is `r round(mean(merged_data$age1,na.rm=T),1)` years (SD=0.92), whereas at young adulthood the mean age is `r round(mean(merged_data$age_162,na.rm=T),1)` (SD=0.69).
+
+
+## Figure 1: Flowchart
+
+The code chunk below was used to generate information for Figure 1, a flowchart that shows the number of twins in the analyses.
+
+```{r flowchart, collapse = TRUE}
+#complete data where zygosity of twins are known
+complete<-subset(merged_data,!is.na(randomtwinid)&!is.na(zygos))
+table(merged_data$zygos) # 1 = MZ, 2 = DZ
+table(complete$zygos) # test if it's the same
+sum(table(complete$zygos))
+#initial twin sample - 18,112 (6522 MZ, 11590 DZ)
+
+number_of_twins_involved<-subset(complete, # with known zygosity
+       ((genotyped1=="1")| # with genotype data
+        (!is.na(pcbhmfqt1)| #child-rated MFQ # at least one MH data at age 16
+        !is.na(ppbhmfqt1)| #parent-rated MFQ
+        !is.na(ppbhconnt1)| #parent-rated ADHD
+        !is.na(pcbhprndt1)| #paranoia
+        !is.na(pcbhcapst1)| # caps
+        !is.na(pcbhcgdst1)| # cognitive disorganisation
+        !is.na(pcbhgrndt1)| # grandiosity
+        !is.na(pcbhtepst1)| # TEPS
+        !is.na(ppbhsanst1)| # SANS
+        !is.na(pcbhinsomt1))|
+         !is.na(NSSH1)|!is.na(SSH1))) #no missing self-harm data
+
+dim(number_of_twins_involved) #15766
+table(number_of_twins_involved$zygos, useNA="always") #5409 MZ, 10357 DZ
+prop.table(table(number_of_twins_involved$sex1)) #53.6% females
+
+#twins who were genotyped among the twins used
+complete1.5<-subset(number_of_twins_involved,genotyped1=="1")
+dim(complete1.5) #10,319
+table(complete1.5$zygos) #2670 MZ, 7649 DZ
+prop.table(table(complete1.5$sex1)) #51.9% females
+complete1.6<-subset(number_of_twins_involved,genotyped1=="1"&pcbhdata1=="1")
+dim(complete1.6) #6001
+table(complete1.6$zygos) #1510 MZ, 4491 DZ
+DZtwin<-complete1.6%>%
+  filter(zygos==2)
+
+
+freq_table<-DZtwin%>%
+  dplyr::select(randomfamid,DZtwinpair)%>%
+  dplyr::filter(DZtwinpair==1)%>%
+  dplyr::group_by(randomfamid)%>%
+  dplyr::tally()
+
+table(freq_table$n) #1992 complete pairs of DZ twins
+
+#now filter out twins without even 1 MH data at age 16
+complete2<-subset(number_of_twins_involved,
+        (!is.na(pcbhmfqt1)| #child-rated MFQ
+        !is.na(ppbhmfqt1)| #parent-rated MFQ
+        !is.na(ppbhconnt1)| #parent-rated ADHD
+        !is.na(pcbhprndt1)| #paranoia
+        !is.na(pcbhcapst1)| # caps
+        !is.na(pcbhcgdst1)| # cognitive disorganisation
+        !is.na(pcbhgrndt1)| # grandiosity
+        !is.na(pcbhtepst1)| # TEPS
+        !is.na(ppbhsanst1)| # SANS
+        !is.na(pcbhinsomt1)))#insomnia
+dim(complete2) #10,251
+sum(table(complete2$zygos))
+table(complete2$zygos, useNA="always") #3689 MZ, 6562 DZ
+
+complete2.5<-subset(complete2,!is.na(age_161))
+dim(complete2.5) #10,233
+sum(table(complete2.5$zygos))
+table(complete2.5$zygos, useNA="always") #3861 MZ, 6552 DZ
+
+
+# now filter out twins without self-harm data
+# Use "number_of_twins_involved" first version
+complete3.5<-subset(number_of_twins_involved,
+                  !is.na(NSSH1)|!is.na(SSH1))
+dim(complete3.5) #9295 total
+table(complete3.5$zygos) #3401 MZ, 5894 DZ
+
+complete3.6<-subset(complete3.5,
+                  !is.na(age1))
+dim(complete3.6) #9295 total
+table(complete3.6$zygos) #3401 MZ, 5894 DZ
+
+#genotyped twins with self-harm + MH data
+complete4<-subset(number_of_twins_involved,
+                  ((genotyped1==1&!is.na(age_161))&
+        ((!is.na(pcbhmfqt1)| #child-rated MFQ
+        !is.na(ppbhmfqt1)| #parent-rated MFQ
+        !is.na(ppbhconnt1)| #parent-rated ADHD
+        !is.na(pcbhprndt1)| #paranoia
+        !is.na(pcbhcapst1)| # caps
+        !is.na(pcbhcgdst1)| # cognitive disorganisation
+        !is.na(pcbhgrndt1)| # grandiosity
+        !is.na(pcbhtepst1)| # TEPS
+        !is.na(ppbhsanst1)| # SANS
+        !is.na(pcbhinsomt1))&!is.na(age_161))&
+         (!is.na(NSSH1)|!is.na(SSH1))))
+dim(complete4) #4294 total
+table(complete4$zygos) # 1075 MZ, 3219 DZ
+
+#apple OR rule for the three variables:
+#genotyped twins with self-harm + MH data
+complete4.5<-subset(number_of_twins_involved,
+                  ((genotyped1==1&!is.na(age_161))|
+        ((!is.na(pcbhmfqt1)| #child-rated MFQ
+        !is.na(ppbhmfqt1)| #parent-rated MFQ
+        !is.na(ppbhconnt1)| #parent-rated ADHD
+        !is.na(pcbhprndt1)| #paranoia
+        !is.na(pcbhcapst1)| # caps
+        !is.na(pcbhcgdst1)| # cognitive disorganisation
+        !is.na(pcbhgrndt1)| # grandiosity
+        !is.na(pcbhtepst1)| # TEPS
+        !is.na(ppbhsanst1)| # SANS
+        !is.na(pcbhinsomt1))&!is.na(age_161))|
+         (!is.na(NSSH1)|!is.na(SSH1))))
+dim(complete4.5)
+prop.table(table(complete4.5$sex1)) #56.6% females
+table(complete4.5$zygos) # 4586 MZ, 8137 DZ
+
+
+complete5<-subset(complete4,!is.na(MDD100_res_t1))
+dim(complete5);dim(complete4) #4294 total
+prop.table(table(complete4$sex1)) #61.3% females
+
+```
+
+
+## Table 1: Prevalence of NSSH and SSH in this sample
+
+```{r prevalence}
+# write function to create the table for the full sample, male and female samples: 
+table_1_fun<-function(X1,X2,X3){
+total_NSSH=sum(table(X1, useNA="always")) #total for NSSH
+table_NSSH=table(X1)
+prop_NSSH=round(prop.table(table(X1))*100,2)
+total_SSH=sum(table(X2,useNA="always")) #total for NSSH
+table_SSH=table(X2)
+prop_SSH=round(prop.table(table(X2))*100,2)
+meanage=round(mean(X3,na.rm=T),1)
+return(rbind(cbind(total_NSSH,table_NSSH,prop_NSSH),cbind(total_SSH,table_SSH,prop_SSH),meanage))
+
+}
+
+# use complete3.6 which has twins without missing self-harm data and without missing age at young adulthood.
+fullsample=table_1_fun(complete3.6$NSSH1,
+                       complete3.6$SSH1,
+                       complete3.6$u1cage1)
+
+final_table<-as.data.frame(cbind(fullsample),
+                           row.names=c(rep("NSSH",5),rep("SSH",5),"mean age (years)"))
+colnames(final_table)<-c("Total N","N in each group","%")
+
+rownames(final_table)<-c("NSSH: No",
+                         "NSSH: Yes, 1-2 times",
+                         "NSSH: Yes, 3-5 times",
+                         "NSSH: Yes, 6-10 times", 
+                         "NSSH: Yes, >10 times",
+                         "SSH: No",
+                         "SSH: Yes, 1-2 times",
+                         "SSH: Yes, 3-5 times",
+                         "SSH: Yes, 6-10 times", 
+                         "SSH: Yes, >10 times", 
+                         "Mean age (Years)")
+
+kableExtra::kable(final_table,digits=c(0,0,2),align="c")%>%
+  kableExtra::kable_styling(font_size = 12)%>%
+  collapse_rows()
+
+#xlsx::write.xlsx(final_table,"/Users/kai/OneDrive - King's College London/PhD/MR_DOC/results/MR_DoC_results_27_April_2021.xlsx",sheetName = "Table1",append = T)
+
+#xlsx::write.xlsx(final_table,"C:/Users/k1756035/OneDrive - King's College London/PhD/MR_DOC/write_up/Tables.xlsx",sheetName = "Table1_updated",append = T)
+
+```
+
+The sample size is `r fullsample[1,1] `. <br>
+
+## Table for mental health measures
+```{r MH measures}
+#rename some columns to ease the next steps:
+MH_descriptive<-complete2.5%>%
+  mutate(
+    "parent-rated CPRS"=ppbhconnt1,
+    "parent-rated MFQ"=ppbhmfqt1,
+    "child-rated MFQ"=pcbhmfqt1,
+    "child-rated hallucinations"=pcbhcapst1,
+    "child-rated grandiosity"=pcbhgrndt1,
+    "child-rated paranoia"=pcbhprndt1,
+    "parent-rated negative symptoms"=ppbhsanst1,
+    "child-rated anhedonia"=pcbhtepstr_1,
+    "child-rated cognitive disorganisation"=pcbhcgdst1,
+    "child-rated insomnia severity"=pcbhinsomt1)
+
+DesData <- subset(MH_descriptive, !is.na(age_161&age_162) &!is.na(sex1&sex2))
+#select only one twin from each pair because of double entry method 
+measures<-c("child-rated MFQ", 
+            "parent-rated MFQ", 
+            "parent-rated CPRS",
+            "child-rated paranoia",
+            "child-rated hallucinations",
+            "child-rated cognitive disorganisation",
+            "child-rated grandiosity",
+            "child-rated anhedonia",
+            "parent-rated negative symptoms",
+            "child-rated insomnia severity")
+
+des_table<-data.frame()
+for (i in 1:length(measures))
+{des<-psych::describe(DesData[,measures[i]])
+  des_table[i,1]<-measures[i]
+  des_table[i,c(2:6)]<-c(des$n,des$mean,des$min,des$max,des$sd)}
+colnames(des_table)<-c("Measure","Sample size (N)","Mean","Minimum","Maximum","SD")
+
+kableExtra::kable(des_table,digits=2,align="c")%>%
+  kableExtra::kable_styling(font_size = 12)
+#xlsx::write.xlsx(des_table,"C:/Users/k1756035/OneDrive - King's College London/PhD/MR_DOC/write_up/Tables.xlsx",sheetName = "Table_S1_14_Sept_21",append = T)
+```
+
+## Calculate the Cronbach's alphas
+Cronbach's alphas for each mental health measure are calculated and reported in the manuscript
+```{r cronbach alpha,collapse = TRUE}
+(cMFQ_alpha<-merged_data%>%
+  dplyr::select(pcbhmfq011, pcbhmfq021, pcbhmfq031,
+ pcbhmfq041, pcbhmfq051, pcbhmfq061, pcbhmfq071, pcbhmfq081, pcbhmfq091,
+ pcbhmfq101, pcbhmfq111, pcbhmfq121, pcbhmfq131)%>%
+  ltm::cronbach.alpha(na.rm=T))
+#0.883
+
+(pMFQ_alpha<-merged_data%>%
+  dplyr::select(ppbhmfq011, ppbhmfq021, ppbhmfq031,
+ ppbhmfq041, ppbhmfq051, ppbhmfq061, ppbhmfq071, ppbhmfq081,
+ ppbhmfq091, ppbhmfq101, ppbhmfq111)%>%
+  ltm::cronbach.alpha(na.rm=T))
+#0.862
+
+(pADHD_alpha<-merged_data%>%
+  dplyr::select(ppbhconn011, ppbhconn051, ppbhconn081,
+ ppbhconn101, ppbhconn111, ppbhconn131, ppbhconn141, ppbhconn161, ppbhconn181,ppbhconn021, ppbhconn031, ppbhconn041,
+ ppbhconn061, ppbhconn071, ppbhconn091, ppbhconn121, ppbhconn151, ppbhconn171)%>%
+  ltm::cronbach.alpha(na.rm=T))
+#0.903
+
+(pSANS<-merged_data%>%
+  dplyr::select(ppbhsans011, ppbhsans021, ppbhsans031,
+ ppbhsans041, ppbhsans051, ppbhsans061, ppbhsans071, ppbhsans081, ppbhsans091, ppbhsans101)%>%
+  ltm::cronbach.alpha(na.rm=T))
+#0.855
+
+(cTEPS<-merged_data%>%
+  dplyr::select(pcbhteps011, pcbhteps021, pcbhteps03r1,
+ pcbhteps041, pcbhteps051, pcbhteps061, pcbhteps071, pcbhteps081, pcbhteps091, pcbhteps101)%>%
+  ltm::cronbach.alpha(na.rm=T))
+#0.772
+
+(cCAPS<-merged_data%>%
+  dplyr::select(pcbhcaps11, pcbhcaps21, pcbhcaps31,pcbhcaps41, pcbhcaps51, pcbhcaps61, pcbhcaps71, pcbhcaps81, pcbhcaps91)%>%
+  ltm::cronbach.alpha(na.rm=T))
+#0.881
+
+(cGRND<-merged_data%>%
+  dplyr::select(pcbhgrnd11, pcbhgrnd21, pcbhgrnd31,pcbhgrnd41, pcbhgrnd51, pcbhgrnd61, pcbhgrnd71, pcbhgrnd81)%>%
+  ltm::cronbach.alpha(na.rm=T))
+#0.856
+
+(cCGDS<-merged_data%>%
+  dplyr::select(pcbhcgds011, pcbhcgds021, pcbhcgds031,
+ pcbhcgds041, pcbhcgds051, pcbhcgds061, pcbhcgds071, pcbhcgds081,
+ pcbhcgds091, pcbhcgds101, pcbhcgds111)%>%
+  ltm::cronbach.alpha(na.rm=T))
+#0.771
+
+
+(cPRND<-merged_data%>%
+  dplyr::select(pcbhprnd011, pcbhprnd021, pcbhprnd031,
+ pcbhprnd041, pcbhprnd051, pcbhprnd061, pcbhprnd071, pcbhprnd081, pcbhprnd091,
+ pcbhprnd101, pcbhprnd111, pcbhprnd121, pcbhprnd131, pcbhprnd141, pcbhprnd151)%>%
+  ltm::cronbach.alpha(na.rm=T))
+#0.926
+
+
+(cINSOM<-merged_data%>%
+  dplyr::select(pcbhinsom11, pcbhinsom21, pcbhinsom31,
+ pcbhinsom41, pcbhinsom51, pcbhinsom61, pcbhinsom71)%>%
+  ltm::cronbach.alpha(na.rm=T))
+#0.89
+```
+
+## Calculating the correlation between child-rated and parent-rated MFQ
+
+We were asked by the reviewers to present the correlation between child-rated and parent-rated MFQ.
+
+```{r correlation,collapse = TRUE}
+# How about log-tranformed cmfq and pmfq?
+merged_data$res_basic_cMFQ1<- residuals(lm(merged_data$pcbhmfqt1
+                                           ~merged_data$age_161 + merged_data$sex1,
+                                           na.action="na.exclude"))
+merged_data$res_trans_order_cMFQ1 <-log(merged_data$res_basic_cMFQ1+6)*2
+
+merged_data$res_basic_pMFQ1<- residuals(lm(merged_data$ppbhmfqt1
+                                           ~merged_data$age_161 + merged_data$sex1,
+                                           na.action="na.exclude"))
+merged_data$res_trans_order_pMFQ1 <-log(merged_data$res_basic_pMFQ1+1.5)*3
+
+cor<-cor.test(merged_data$res_trans_order_pMFQ1,merged_data$res_trans_order_cMFQ1,use = "pairwise.complete.obs")
+
+```
+
+The correlation between pMFQ and cMFQ was: `r round(cor$estimate,3)`. <br>
+
+## Overlap between NSSH and SSH
+
+We also looked at the overlap between NSSH and SSH groups. Look for the phenotypic correlation between NSSH and SSH. 
+
+```{r NSSH-SSH}
+overlap=complete3.6
+
+corSH<-polycor::hetcor(as.factor(overlap$NSSH1),as.factor(overlap$SSH1))
+corSH
+
+
+# Now recode NSSH and SSH into binary variables to study overlapping. 
+bin_NSSH1<-ifelse(overlap$NSSH1>0,1,0)
+bin_SSH1<-ifelse(overlap$SSH1>0,1,0)
+
+
+## Plot without missing data
+freq_table <- as.data.frame(table(bin_NSSH1, bin_SSH1))
+
+## count in proportion
+freq_table_prop<-as.data.frame(prop.table(table(bin_NSSH1, bin_SSH1)))%>%
+  mutate(bin_NSSH1=recode(bin_NSSH1, "0" = "No","1" = "Yes"))%>%
+  mutate(bin_SSH1=recode(bin_SSH1, "0" = "No","1" = "Yes"))%>%
+  add_column(N=freq_table$Freq)
+
+freq_table_prop$Percentage=round(freq_table_prop$Freq*100,1)
+freq_table_prop=freq_table_prop%>%
+  mutate_if(is.factor,as.character)
+
+(FigS1<-ggplot(freq_table_prop, aes(bin_NSSH1, bin_SSH1)) +
+  geom_tile(aes(fill = Percentage), colour = "black") +
+  scale_fill_gradient(low= "#A1C9F7",high="#B5179E")+
+  geom_text(aes(label = paste0(Percentage,"%", "\n","(n = ",N,")")), size=8)+
+    theme(text = element_text(size=20),
+          panel.grid = element_blank(),
+          panel.background = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text = element_text(margin=margin(0)),
+          plot.title=element_text(hjust=0.5))+
+  labs(y="Ever SSH", x="Ever NSSH", fill="Percentage (%)",title="Overlap between NSSH and SSH"))
+
+#ggsave("../write_up/Figure_S1.jpg")
+
+```
+
+
+# Polygenic scoring analyses
+For polygenic scoring analyses, we used the GEE package to run regression analyses and exploited the "exchangeable" argument to control for non-independence of the twin structure.
+
+```{r prs-analysis, results='hide'}
+results<-"C:/Users/k1756035/OneDrive - King's College London/PhD/MR_DOC/Results"
+#### try using gee from geepack ####
+## firstly, create dummy variables first
+dummydata<-dummy_columns(self_harm_data_c, select_columns =c("Chip", "Batch"),remove_first_dummy = TRUE)
+colnames(dummydata)[(length(colnames(dummydata))-9):length(colnames(dummydata))]<-c("Chip_affy", "Chip_oee",
+                                "Batch_affy","Batch_bt1","Batch_bt2",                          "Batch_bt3","Batch_bt4","Batch_bt5","Batch_bt6","Batch_btDZ") #need to use one column only
+identical(dummydata$Batch_affy, dummydata$Chip_affy) #chip and batch has same values, drop this from analyses
+```
+
+## PRS analysis using GEE package  {.tabset}
+The scripts for GEE analyses are shown below in different tabs:
+
+### MDD
+```{r gee-MDD, results='hide', message=FALSE}
+##### use GEE for MDD ####
+MDDPRS=c( "MDD001"  , "MDD030"  , "MDD100")
+MDDOUT=c("pcbhmfqt1","ppbhmfqt1")
+## for child-rated and parent-rated MFQ
+GEE_MDD=matrix(nrow = length(MDDPRS)*length(MDDOUT),ncol=5)
+
+for(i in seq(from=1,to=length(MDDOUT),by=1))
+{dummydata$XO=NA;dummydata$XO=dummydata[,MDDOUT[i]]
+for (j in seq(from=1,to=length(MDDPRS),by=1))
+{ dummydata$XD=NA;dummydata$XD=dummydata[,MDDPRS[j]] #with=F, refer to data.table FAQ 1.1
+
+gee1=gee(XO~scale(XD)+PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10+Chip_affy+
+                  Batch_bt1+Batch_bt2+Batch_bt3+Batch_bt4+Batch_bt5+Batch_bt6+
+                  sex1+pcbhage1, 
+                  id=randomfamid,
+                  corstr="exchangeable",
+                  data=dummydata)
+
+gee2=gee(XO~PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10+Chip_affy+
+            Batch_bt1+Batch_bt2+Batch_bt3+Batch_bt4+Batch_bt5+Batch_bt6+
+            sex1+pcbhage1, 
+          id=randomfamid,
+          corstr="exchangeable",
+          data=dummydata)
+#get p-value
+pval=2 * pnorm(abs(coef(summary(gee1))[2,5]), lower.tail = FALSE)
+#get beta
+beta=coef(summary(gee1))[2,1]
+#get R2
+Y_bar1 = mean(gee1$y, na.rm = T)
+Y_bar2 = mean(gee2$y, na.rm = T)
+rsquare_gee1 <- 1-(sum((gee1$y - gee1$fitted.values)^2, na.rm = T)/sum((gee1$y - Y_bar1)^2, na.rm = T))
+rsquare_gee2 <- 1-(sum((gee2$y - gee2$fitted.values)^2, na.rm = T)/sum((gee2$y - Y_bar2)^2, na.rm = T))
+R2=rsquare_gee1-rsquare_gee2
+#get 95% CI
+se <- summary(gee1)$coefficients["scale(XD)","Robust S.E."]
+CI=coef(gee1)["scale(XD)"]+c(-1, 1) * se * qnorm(0.975)
+#summarise results
+k=3*(i-1)
+GEE_MDD[j+k,1:5]=c(beta,CI, pval,R2)
+}}
+
+colnames(GEE_MDD)=c("beta coefficient","Lower 95% CI", "Upper 95% CI","p-value","R2")
+rownames(GEE_MDD)<-as.vector(outer(MDDPRS, MDDOUT, paste, sep="."))
+GEE_MDD
+```
+
+### ADHD
+```{r gee-adhd, results='hide',message=FALSE}
+##### use GEE for ADHD ######
+ADHDPRS=c( "ADHD001"  , "ADHD030"  , "ADHD100")
+
+## for parent-rated Conner's scale
+GEE_ADHD=matrix(nrow = length(ADHDPRS),ncol=5)
+
+for(i in seq(from=1,to=length(ADHDPRS),by=1))
+{ dummydata$XD=NA;dummydata$XD=dummydata[,ADHDPRS[i]] #with=F, refer to data.table FAQ 1.1
+
+gee1=gee(ppbhconnt1~scale(XD)+PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10+Chip_affy+
+           Batch_bt1+Batch_bt2+Batch_bt3+Batch_bt4+Batch_bt5+Batch_bt6+
+           sex1+pcbhage1, 
+         id=randomfamid,
+         corstr="exchangeable",
+         data=dummydata)
+
+gee2=gee(ppbhconnt1~PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10+Chip_affy+
+           Batch_bt1+Batch_bt2+Batch_bt3+Batch_bt4+Batch_bt5+Batch_bt6+
+           sex1+pcbhage1, 
+         id=randomfamid,
+         corstr="exchangeable",
+         data=dummydata)
+#get p-value
+pval=2 * pnorm(abs(coef(summary(gee1))[2,5]), lower.tail = FALSE)
+#get beta
+beta=coef(summary(gee1))[2,1]
+#get R2
+Y_bar1 = mean(gee1$y, na.rm = T)
+Y_bar2 = mean(gee2$y, na.rm = T)
+rsquare_gee1 <- 1-(sum((gee1$y - gee1$fitted.values)^2, na.rm = T)/sum((gee1$y - Y_bar1)^2, na.rm = T))
+rsquare_gee2 <- 1-(sum((gee2$y - gee2$fitted.values)^2, na.rm = T)/sum((gee2$y - Y_bar2)^2, na.rm = T))
+R2=rsquare_gee1-rsquare_gee2
+#get 95% CI
+se <- summary(gee1)$coefficients["scale(XD)","Robust S.E."]
+CI=coef(gee1)["scale(XD)"]+c(-1, 1) * se * qnorm(0.975)
+#summarise results
+GEE_ADHD[i,1:5]=c(beta,CI, pval,R2)
+}
+
+colnames(GEE_ADHD)=c("beta coefficient","Lower 95% CI", "Upper 95% CI","p-value","R2")
+rownames(GEE_ADHD)<-as.vector(outer(ADHDPRS, "ppbhconnt1", paste, sep="."))
+GEE_ADHD
+```
+
+### Schizophrenia
+```{r gee-SCZ, results='hide',message=FALSE}
+##### use GEE for SCZ #####
+SCZPRS=c( "SCZ001"  , "SCZ030"  , "SCZ100")
+SCZOUT=c("pcbhprndt1", "pcbhcapst1", "pcbhcgdst1","pcbhgrndt1","pcbhtepstr_1","ppbhsanst1")
+## for child-rated and parent-rated MFQ
+GEE_SCZ=matrix(nrow = length(SCZPRS)*length(SCZOUT),ncol=5)
+
+for(i in seq(from=1,to=length(SCZOUT),by=1))
+{dummydata$XO=NA;dummydata$XO=NA;dummydata$XO=dummydata[,SCZOUT[i]]
+for (j in seq(from=1,to=length(SCZPRS),by=1))
+{ dummydata$XD=NA;dummydata$XD=dummydata[,SCZPRS[j]] #with=F, refer to data.table FAQ 1.1
+
+gee1=gee(XO~scale(XD)+PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10+Chip_affy+
+           Batch_bt1+Batch_bt2+Batch_bt3+Batch_bt4+Batch_bt5+Batch_bt6+
+           sex1+pcbhage1, 
+         id=randomfamid,
+         corstr="exchangeable",
+         data=dummydata)
+
+gee2=gee(XO~PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10+Chip_affy+
+           Batch_bt1+Batch_bt2+Batch_bt3+Batch_bt4+Batch_bt5+Batch_bt6+
+           sex1+pcbhage1, 
+         id=randomfamid,
+         corstr="exchangeable",
+         data=dummydata)
+#get p-value
+pval=2 * pnorm(abs(coef(summary(gee1))[2,5]), lower.tail = FALSE)
+#get beta
+beta=coef(summary(gee1))[2,1]
+#get R2
+Y_bar1 = mean(gee1$y, na.rm = T)
+Y_bar2 = mean(gee2$y, na.rm = T)
+rsquare_gee1 <- 1-(sum((gee1$y - gee1$fitted.values)^2, na.rm = T)/sum((gee1$y - Y_bar1)^2, na.rm = T))
+rsquare_gee2 <- 1-(sum((gee2$y - gee2$fitted.values)^2, na.rm = T)/sum((gee2$y - Y_bar2)^2, na.rm = T))
+R2=rsquare_gee1-rsquare_gee2
+#get 95% CI
+se <- summary(gee1)$coefficients["scale(XD)","Robust S.E."]
+CI=coef(gee1)["scale(XD)"]+c(-1, 1) * se * qnorm(0.975)
+#summarise results
+k=3*(i-1)
+GEE_SCZ[j+k,1:5]=c(beta,CI, pval,R2)
+}}
+
+colnames(GEE_SCZ)=c("beta coefficient","Lower 95% CI", "Upper 95% CI","p-value","R2")
+rownames(GEE_SCZ)<-as.vector(outer(SCZPRS, SCZOUT, paste, sep="."))
+GEE_SCZ
+```
+
+### Insomnia
+```{r gee-insom, results='hide',message=FALSE}
+##### use GEE for INSOM #####
+INSOMPRS=c( "INSOM001"  , "INSOM030"  , "INSOM100")
+
+## for parent-rated Conner's scale
+GEE_INSOM=matrix(nrow = length(INSOMPRS),ncol=5)
+
+for(i in seq(from=1,to=length(INSOMPRS),by=1))
+{ dummydata$XD=NA;dummydata$XD=dummydata[,INSOMPRS[i]] #with=F, refer to data.table FAQ 1.1
+
+gee1=gee(pcbhinsomt1~scale(XD)+PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10+Chip_affy+
+           Batch_bt1+Batch_bt2+Batch_bt3+Batch_bt4+Batch_bt5+Batch_bt6+
+           sex1+pcbhage1, 
+         id=randomfamid,
+         corstr="exchangeable",
+         data=dummydata)
+
+gee2=gee(pcbhinsomt1~PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC9+PC10+Chip_affy+
+           Batch_bt1+Batch_bt2+Batch_bt3+Batch_bt4+Batch_bt5+Batch_bt6+
+           sex1+pcbhage1, 
+         id=randomfamid,
+         corstr="exchangeable",
+         data=dummydata)
+#get p-value
+pval=2 * pnorm(abs(coef(summary(gee1))[2,5]), lower.tail = FALSE)
+#get beta
+beta=coef(summary(gee1))[2,1]
+#get R2
+Y_bar1 = mean(gee1$y, na.rm = T)
+Y_bar2 = mean(gee2$y, na.rm = T)
+rsquare_gee1 <- 1-(sum((gee1$y - gee1$fitted.values)^2, na.rm = T)/sum((gee1$y - Y_bar1)^2, na.rm = T))
+rsquare_gee2 <- 1-(sum((gee2$y - gee2$fitted.values)^2, na.rm = T)/sum((gee2$y - Y_bar2)^2, na.rm = T))
+R2=rsquare_gee1-rsquare_gee2
+#get 95% CI
+se <- summary(gee1)$coefficients["scale(XD)","Robust S.E."]
+CI=coef(gee1)["scale(XD)"]+c(-1, 1) * se * qnorm(0.975)
+#summarise results
+GEE_INSOM[i,1:5]=c(beta,CI, pval,R2)
+}
+
+colnames(GEE_INSOM)=c("beta coefficient","Lower 95% CI", "Upper 95% CI","p-value","R2")
+rownames(GEE_INSOM)<-as.vector(outer(INSOMPRS, "pcbhinsomt1", paste, sep="."))
+GEE_INSOM
+
+```
+
+### FDR correction
+```{r FDR-correction, results='hide',message=FALSE}
+##### combine results from gee and FDR correction ######
+gee_results<-as.data.frame(rbind(GEE_MDD,GEE_ADHD,GEE_SCZ,GEE_INSOM))
+gee_results$FDR=p.adjust(gee_results$`p-value`, method = "fdr", n = length(gee_results$`p-value`))
+gee.FDR.results<-gee_results[gee_results$FDR<0.05,] # only cMFQ, pMFQ and ADHD are significant after FDR correction. 
+gee.FDR.results
+
+# we only selected PRS threshold=1
+gee_100<-as.data.frame(rbind(GEE_MDD,GEE_ADHD,GEE_SCZ,GEE_INSOM))
+
+gee_100<-gee_100%>%
+  rownames_to_column()%>%
+  slice(c(grep("*100", rownames(gee_100))))
+
+gee_100<-gee_100%>%add_column(FDR=p.adjust(gee_100$`p-value`, method = "fdr", n = length(gee_100$`p-value`)))
+```
+
+## Print PRS analysis results
+Print the results from gee() function.
+```{r compare-glm-gee}
+
+kableExtra::kable(gee_100,digits=4,align="c")%>%
+  kableExtra::kable_styling(font_size = 12)
+
+```
+
+
+We then wrote the results to Excel sheets.
+```{r write-results, eval=FALSE}
+setwd(results)
+xlsx::write.xlsx(gee_results,"PRS_results_14_September_2021.xlsx",sheetName = "gee_all")
+xlsx::write.xlsx(gee.FDR.results,"PRS_results_14_September_2021.xlsx",sheetName = "gee_FDR",append = T)
+xlsx::write.xlsx(gee_100,"PRS_results_14_September_2021.xlsx",sheetName = "gee_100",append = T)
+xlsx::write.xlsx(GEE_TEPSR,"PRS_results_14_September_2021.xlsx",sheetName = "anhedonia",append = T)
+```
+
+# MR-DoC Models
+The code chunk below will show the MR-DoC model codes for each MR-DoC models.
+
+The scripts in each tab also include the sensitivity analyses that were carried out (fixing re at different values to test sensitivity of causal estimates). The results were then stored in RData format to be processed later.
+
+## Model scripts {.tabset}
+
+### cMFQ-NSSH
+```{r cMFQ-NSSH, eval=FALSE}
+###### Regress out age, sex and transform cMFQ variable #####
+#******************************************************
+#**Regressing  out age & sex **#
+merged_data$res_basic_cMFQ1<- residuals(lm(merged_data$pcbhmfqt1
+                                           ~merged_data$age_161 + merged_data$sex1,
+                                           na.action="na.exclude"))
+merged_data$res_trans_order_cMFQ1 <-log(merged_data$res_basic_cMFQ1+6)*2
+
+#do same thing for twin 2. 
+merged_data$res_basic_cMFQ2<- residuals(lm(merged_data$pcbhmfqt2
+                                           ~merged_data$age_162 + merged_data$sex2,
+                                           na.action="na.exclude"))
+
+merged_data$res_trans_order_cMFQ2 <-log(merged_data$res_basic_cMFQ2+6)*2
+#***************************************************************************************
+#################################### MR-DoC model ######################################
+#***************************************************************************************
+
+#variables I will need for this cMFQ MR-DoC model:
+vars		<-c('MDD_PRS','cMFQ','SH')
+
+#variables for the second ACE fit to compare results (residualised then transformed)
+selVars	<-c('MDD100_res_t1', 'res_trans_order_cMFQ1','NSSH1',
+            'MDD100_res_t2', 'res_trans_order_cMFQ2','NSSH2') 
+
+
+useVars	<-c('MDD100_res_t1', 'res_trans_order_cMFQ1','NSSH1',
+            'MDD100_res_t2', 'res_trans_order_cMFQ2','NSSH2',
+            'age1', 'age2', 'sex1','sex2') #age is for at age 21
+
+#need to recode missing age into 999
+table(is.na(merged_data$age1))
+merged_data$NSSH1[is.na(merged_data$age1)] <- NA
+merged_data$NSSH2[is.na(merged_data$age2)] <- NA
+merged_data$age1[is.na(merged_data$age1)] <- 999
+merged_data$age2[is.na(merged_data$age2)] <- 999
+merged_data[1:20,1:8]
+
+#mz and dzdata for using res_trans_order_cMFQ
+mzdata<-subset(merged_data, zygos%in%1&random==1 , useVars)
+dzdata<-subset(merged_data, zygos%in%2&random==1 , useVars)
+
+
+head(mzdata)
+
+#do ACE model #
+nv			<- 3				# number of variables for a twin = 1 in Univariate
+nvo 			<- 1     			#number of ordinal variables per twin
+nvc 			<- nv-nvo  			#number of continuous variables per twin
+poso 			<- nvo 			#position where ordinal variables start
+ntv			<- 2*nv			# number of variables for a pair = 2* 1 for Univariate
+nth			<- 4	# number of max thresholds
+nfact		<- 3				# number of Latent Factors 
+ncor			<- (nv*(nv+1)/2)-nv	# number of free elements in a correlation matrix nv*nv
+ninc 			<- nth-1 			#number of max increments
+ncovariates 	<- 2 				#number of covariates
+
+
+# Define definition variables to hold the Covariates
+
+obsAge1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age1"), name="Age1")
+obsAge2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age2"), name="Age2")
+obsSex1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex1"), name="Sex1")
+obsSex2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex2"), name="Sex2")
+
+#effect of age and sex on ordinal variable
+LabCovA	<-c('BageThNSSH', 'BageThNSSH','BageThNSSH', 'BageThNSSH')
+LabCovS <-c('BsexThNSSH', 'BsexThNSSH','BsexThNSSH', 'BsexThNSSH')
+
+betaA		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovA, name="BageTH" )
+betaS		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovS, name="BsexTH" )
+
+#mean matrix, set NSSH to NA and fixed
+StMZmean=c(colMeans(mzdata[,1:2],na.rm=TRUE),0)
+Mean	<-mxMatrix( "Full", 1, ntv, free=c(T,T,F,T,T,F), values=StMZmean, labels=c("mPGS", 'mcMFQ',NA, "mPGS", 'mcMFQ',NA), name="ExpMean" )
+
+
+#Threshold matrix
+StTH		<-c(-1,0.1,0.1,0.1)
+LabTh	<-c('Tmz_11','imz_11','imz_12','imz_13')
+Tr		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=StTH, lbound=c(-4,0.001,0.001,0.001), ubound=c(4,4),
+                labels=LabTh, name="Th")
+
+inc		<-mxMatrix( type="Lower",nrow=nth, ncol=nth, free=F, values=1, name="Low")
+
+Thres	<-mxAlgebra( expression= cbind(Low%*%Th + BageTH%x%Age1 + BsexTH%x%Sex1,
+                                     Low%*%Th + BageTH%x%Age2 + BsexTH%x%Sex2),
+                   name="ExpThres")
+
+#Matrix that holds loadings from observed to latent variables
+PatFl	<- c(F,F,F,
+           F,F,F,
+           F,F,F) # Fix observed to latent to be 1 for all variables
+StFl		<- c(1,0,0,
+           0,1,0,
+           0,0,1)
+LabFl	<- c('PGS',NA,NA,
+           NA,'X',NA,
+           NA, NA,'Y')
+Load		<-mxMatrix(type="Full",	nrow=nv, ncol=nfact, free=PatFl, values=StFl, labels=LabFl, name="Loadings" )
+Id2		<-mxMatrix(type="Iden",	nrow=2, ncol=2, free=F, name="I2" )
+LoadTw	<-mxAlgebra(I2%x%Loadings, name="FactLTw") #this will be a 2*nv x 2*nfact matrix,making it possible for both twins
+
+#beta matrix to hold causal relationships
+# Define the matrix to hold the Single headed Arrows (causal paths) between the 3 latent variables
+# NB: direction of causation goes DOWN the column & OUT along the row
+PatPhC<-c(F,T,T,
+          F,F,T,
+          F,F,F)
+StPhC<-c(0,0.05,0.05,
+         0,0,0.05,
+         0,0,0)
+LabPhC<-c(NA,"PGS_to_X","PGS_to_Y",
+          NA,NA,"X_to_Y",
+          NA,NA,NA)
+PhCaus	<-mxMatrix(type="Full",	nrow=nfact, ncol=nfact, free=PatPhC, values=StPhC, labels=LabPhC, name="PhC" )
+
+### Build the ACE components
+# Define the matrices to hold the A and C effects: Common (upper) 
+LabAc<-c("Ax","Axy","Ay")
+freeA<-c(T,T,T)
+stA<-c(0.5,0.5,0.5)
+
+LabCc<-c("Cx","Cxy","Cy")
+freeC<-c(T,F,F)
+stC<-c(0.5,0,0)
+
+LabEc<-c("Ex","Exy","Ey")
+freeE<-c(T,F,T)
+stE<-c(0.5,0,0.5)
+
+
+
+PathsAc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeA, values=stA, labels=LabAc , name="ac" )
+PathsCc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeC, values=stC, labels=LabCc , name="cc" )
+PathsEc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeE, values=stE, labels=LabEc , name="ec" )
+covAc		<-mxAlgebra( expression= ac %*% t(ac), name="Ac" ) #cannot parse PGS variance into ACE
+covCc		<-mxAlgebra( expression= cc %*% t(cc), name="Cc" ) #use these for standardisation.
+covEc		<-mxAlgebra( expression= ec %*% t(ec), name="Ec" )
+covPc		<-mxAlgebra( expression= Ac+Cc+Ec, name="Vc" ) #use a 2 x 2 matrix only. 
+
+
+
+MZcovPc		<-mxAlgebra( expression= Ac+Cc, name="MZVc" )
+DZcovPc		<-mxAlgebra( expression= 0.5%x%Ac+Cc, name="DZVc" )
+
+#then specify var for PGS with a unit matrix (freely estimated)
+PGSpath	<-mxMatrix(type="Full", nrow=1, ncol=1, free=T, values=0.5, labels="PGS_sd" , name="PGSp" )
+PGSvar<-mxAlgebra(expression=PGSp%*%t(PGSp),name="varPGS") #this will be the double headed arrow for variance of PGS
+
+#zero matrices
+zeromat<-mxMatrix(type="Zero",nrow=2,ncol=1,free=F,name="zero")
+zeromat2<-mxMatrix(type="Zero",nrow=1,ncol=2,free=F,name="zero2")
+
+totV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,Vc)),name="total_var")
+
+#matrix above is a 3 x 3 matrix, within-twin matrix 
+totMZV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,MZVc)),name="MZ_covar") #this is between person
+totDZV<-mxAlgebra(expression=cbind(rbind(0.5%x%varPGS,zero),rbind(zero2,DZVc)),name="DZ_covar")
+
+# Generate Covariance of Latent factor model Including Causal Paths between factors
+Id3		<-mxMatrix(type="Iden",	nrow=nfact, ncol=nfact, name="I3" )
+
+covFV	<-mxAlgebra( expression= solve(I3-PhC) %&% total_var, name ="FV") #(I3-PhC) gives the expression for the removal of the loop effect of causal relationships between the factors
+covMZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% MZ_covar, name ="MZFV") 
+covDZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% DZ_covar, name ="DZFV") 
+
+
+# Constraint on total variance of Ordinal variable (A+C+E=1)
+varL		<- mxConstraint( expression=FV[3,3]==1, name="L" ) #total variablity after taking into account for causal effects
+
+# Var-Cov of measured vars in terms of latent factors and AC, Cc, and Ec
+#this results in a 6x6 matrix
+
+covMZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, MZFV), cbind(MZFV, FV) )) , name="expCovMZ" ) #This traces the path from vars to factors and back to vars
+covDZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, DZFV), cbind(DZFV, FV) )) , name="expCovDZ" )
+
+
+# Algebra to compute standardized variance components
+#generate a 2x2 matrix which has taken into account for causal effects from FV:
+Var2by2<-mxAlgebra(expression=FV[2:3,2:3],name="FV2by2")
+StA	<- mxAlgebra( expression=Ac/FV2by2, name="h2")
+StC	<- mxAlgebra( expression=Cc/FV2by2, name="c2")
+StE	<- mxAlgebra( expression=Ec/FV2by2, name="e2")
+
+# # Algebra to compute Phenotypic, A, C & E correlations for exposure and outcome
+matI	<- mxMatrix( type="Iden", nrow=nv-1, ncol=nv-1, name="I2")
+rph	<- mxAlgebra( expression= solve(sqrt(I3*FV)) %*% FV %*% solve(sqrt(I3*FV)), name="Rph") #get overall Rph
+rAc	<- mxAlgebra( expression= solve(sqrt(I2*Ac)) %*% Ac %*% solve(sqrt(I2*Ac)), name="Rac" )
+
+
+# Algebra to get standardised b1, b2 and g1 paths:
+beta1=mxAlgebra(expression= (PhC[2,1]*sqrt(FV[1,1]))/(sqrt(FV[2,2])), name="stB1")
+beta2=mxAlgebra(expression= (PhC[3,2]*sqrt(FV[2,2]))/(sqrt(FV[3,3])), name="stG1")
+pleio=mxAlgebra(expression= (PhC[3,1]*sqrt(FV[1,1]))/(sqrt(FV[3,3])), name="stB2")
+
+
+#algebra to get RPh due to A,C,E and causal effects: 
+RphACE<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                   #(sqrt(c2[1,1])*Rcc[2,1]*sqrt(c2[2,2])),
+                                   #(sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), #this should be zero because re will be fixed to zero.
+                                   stB2*stB1, stG1),name="ACErph")
+
+# Data objects for Multiple Groups
+dataMZ	<- mxData( observed=mzdata, type="raw" )
+dataDZ	<- mxData( observed=dzdata, type="raw" )
+
+
+# Objective objects for Multiple Groups
+objMZ		<- mxExpectationNormal( covariance="expCovMZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("NSSH1","NSSH2") )
+objDZ		<- mxExpectationNormal( covariance="expCovDZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("NSSH1","NSSH2") )
+
+fitFunction <- mxFitFunctionML()
+#fitFunction <- mxFitFunctionWLS()
+
+# Combine Groups
+
+pars<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+           covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+           StA,StC,StE,matI,rph,rAc,beta1,beta2,pleio,Var2by2,RphACE)
+
+modelMZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ" )
+modelDZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ" )
+
+
+minus2ll	<-mxAlgebra( expression=MZ.objective + DZ.objective, name="m2LL" )
+obj		<-mxFitFunctionAlgebra( "m2LL" )
+
+ACEModel	<-mxModel("ACE", pars, modelMZ, modelDZ, minus2ll, obj)
+
+#### run the ACE model which already has the parameters set or constrained: 
+ACEFit		<-mxTryHardOrdinal(ACEModel, intervals=F)
+(ACESum	<- summary(ACEFit))
+
+tableMZ<-as.table(mxEval(MZ.expCovMZ,ACEFit))
+colnames(tableMZ)<-c("PGS1","cMFQ1","NSSH1","PGS2","cMFQ2","NSSH2")
+rownames(tableMZ)<-c("PGS1","cMFQ1","NSSH1","PGS2","cMFQ2","NSSH2")
+round(tableMZ,3)
+
+tableDZ<-as.table(mxEval(DZ.expCovDZ,ACEFit))
+colnames(tableDZ)<-c("PGS1","cMFQ1","NSSH1","PGS2","cMFQ2","NSSH2")
+rownames(tableDZ)<-c("PGS1","cMFQ1","NSSH1","PGS2","cMFQ2","NSSH2")
+round(tableDZ,3)
+
+mxEval(MZ.stg1,ACEFit)
+
+pathsCI1	<-mxCI (c ('MZ.stB1','MZ.stB2','MZ.stG1'))
+pathsCI2<-mxCI(c('MZ.h2[1,1]','MZ.c2[1,1]','MZ.e2[1,1]',
+                 'MZ.h2[2,2]','MZ.e2[2,2]'))
+pathsCI3<-mxCI(c('MZ.Rac[2,1]','MZ.Rph[3,2]',
+                 'MZ.ACErph[1,1]','MZ.ACErph[1,2]','MZ.ACErph[1,3]'))
+
+#CI1
+ACEModel1<-mxModel(ACEFit,pathsCI1)
+ACEFit1<-mxRun(ACEModel1,intervals=T)
+(ACESum1	<- summary(ACEFit1))
+
+#CI2
+ACEModel2<-mxModel(ACEFit,pathsCI2)
+ACEFit2<-mxRun(ACEModel2,intervals=T)
+(ACESum2	<- summary(ACEFit2))
+
+#CI3
+ACEModel3<-mxModel(ACEFit,pathsCI3)
+ACEFit3<-mxRun(ACEModel3,intervals=T)
+(ACESum3	<- summary(ACEFit3))
+
+
+sum(mxEval(MZ.ACErph[1:3],ACEFit))
+
+ACESum1$CI
+ACESum2$CI
+ACESum3$CI
+
+mxEval(MZ.MZcovPc,ACEFit)
+mxEval(MZ.PhC,ACEFit)
+##### create full bivariate model without direction of causation for comparison #####
+## re = True, stG1= False, then compare BIC/AIC
+FullBiMod<-mxModel(ACEFit,name="Full_Bi")
+FullBiMod<-omxSetParameters(FullBiMod, labels=c("Exy","X_to_Y"), free=c(T,F),values=c(0.5,0))
+FullBiFit<-mxRun(FullBiMod, intervals=F)
+(FullBiSum<-summary(FullBiFit,verbose=T))
+#check re
+Ec<-mxEval(MZ.Ec,FullBiFit)
+Itwo<-mxEval(MZ.I2,FullBiFit)
+(Rec<-solve(sqrt(Itwo*Ec)) %*% Ec %*% solve(sqrt(Itwo*Ec)))
+
+#check g1 (the causal effect)
+mxEval(MZ.stG1,FullBiFit)
+
+#other values
+mxEval(MZ.stB1,FullBiFit)
+mxEval(MZ.stg1,FullBiFit)
+mxEval(MZ.h2,FullBiFit);mxEval(MZ.c2,FullBiFit);mxEval(MZ.e2,FullBiFit)
+mxEval(MZ.Rac,FullBiFit)
+mxEval(MZ.Rph,FullBiFit)
+
+#get Rcc
+Cc<-mxEval(MZ.Cc,FullBiFit)
+(Rcc<-solve(sqrt(Itwo*Cc)) %*% Cc %*% solve(sqrt(Itwo*Cc)))
+# compare the two models
+mxCompare(FullBiFit,ACEFit)
+
+## now run model without effect of PRS only but still with stG1 and rc,re dropped ###
+DoC_Mod<-mxModel(ACEFit,name="DOC")
+DoC_Mod<-omxSetParameters(DoC_Mod, labels=c("PGS_to_X","PGS_to_Y"), free=c(F,F),values=c(0,0))
+DoC_Fit<-mxRun(DoC_Mod, intervals=F)
+#get CI for stG1
+DoC_Mod_CI<-mxModel(DoC_Fit,mxCI("MZ.stG1"))
+DoC_Fit_CI<-mxRun(DoC_Mod_CI, intervals=T)
+summary(DoC_Fit_CI,verbose=T)
+(DoCSum<-summary(DoC_Fit,verbose=T))
+
+#check PGS effect
+mxEval(MZ.stB1,DoC_Fit);mxEval(MZ.stB2,DoC_Fit)
+#values for the path diagram
+mxEval(MZ.stG1,DoC_Fit)
+mxEval(MZ.h2,DoC_Fit);mxEval(MZ.c2,DoC_Fit);mxEval(MZ.e2,DoC_Fit)
+mxEval(MZ.Rac,DoC_Fit)
+mxEval(MZ.Rph,DoC_Fit)
+mxEval(MZ.expCovMZ,DoC_Fit);mxEval(DZ.expCovDZ,DoC_Fit)
+#compare the models
+mxCompare(ACEFit,DoC_Fit)
+
+##### sensitivity analysis: what if rE is not zero, e.g. fixed to 0.20? #####
+#add re into the model
+rEc	<- mxAlgebra( expression= solve(sqrt(I2*Ec)) %*% Ec %*% solve(sqrt(I2*Ec)), name="Rec" )
+RphACE2<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                   
+                                    (sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), 
+                                    stB2*stB1, stG1),name="ACErph2")
+
+pars2<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+            covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+            StA,StC,StE,matI,rph,rAc,rEc,beta1,beta2,pleio,Var2by2,RphACE2)
+
+modelMZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ2" )
+modelDZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ2" )
+minus2ll2	<-mxAlgebra( expression=MZ2.objective + DZ2.objective, name="m2LL2" )
+obj2		<-mxFitFunctionAlgebra( "m2LL2" )
+rE_fixed_Model	<-mxModel("rE_fixed", pars2, modelMZ2, modelDZ2, minus2ll2, obj2)
+rE_fixed_Model <-omxSetParameters(rE_fixed_Model, labels=c("Exy", "X_to_Y"), free=c(T,T),values=c(0.5,0.2))
+
+pathsCI_rEfix	<-mxCI (c ('MZ2.stG1'))
+#re = 0.05
+rE_fixed_Model005<-mxModel(rE_fixed_Model,name="rE_fixed",
+                           mxConstraint(MZ2.Rec[1,2]==0.05, name="con1"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit1		<- mxTryHardOrdinal(rE_fixed_Model005, intervals = T)
+
+(rE_Fixed_FitSumm1<-summary(rE_Fixed_Fit1,verbose=T))
+mxEval(MZ2.stG1,rE_Fixed_Fit1)
+mxEval(MZ2.Rec,rE_Fixed_Fit1)
+
+## re=0.10
+rE_fixed_Model010<-mxModel(rE_fixed_Model,name="rE_fixed2",
+                           mxConstraint(MZ2.Rec[1,2]==0.10, name="con2"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit2		<- mxTryHardOrdinal(rE_fixed_Model010, intervals = T)
+
+(rE_Fixed_FitSumm2<-summary(rE_Fixed_Fit2,verbose=T))
+
+## re=0.15
+rE_fixed_Model015<-mxModel(rE_fixed_Model,name="rE_fixed3",
+                           mxConstraint(MZ2.Rec[1,2]==0.15, name="con3"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit3		<- mxTryHardOrdinal(rE_fixed_Model015, intervals = T)
+
+(rE_Fixed_FitSumm3<-summary(rE_Fixed_Fit3,verbose=T))
+
+## re=0.20
+rE_fixed_Model020<-mxModel(rE_fixed_Model,name="rE_fixed4",
+                           mxConstraint(MZ2.Rec[1,2]==0.20, name="con4"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit4		<- mxTryHardOrdinal(rE_fixed_Model020, intervals = T)
+
+(rE_Fixed_FitSumm4<-summary(rE_Fixed_Fit4,verbose=T))
+
+## re=0.25
+rE_fixed_Model025<-mxModel(rE_fixed_Model,name="rE_fixed5",
+                           mxConstraint(MZ2.Rec[1,2]==0.25, name="con5"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit5		<- mxTryHardOrdinal(rE_fixed_Model025, intervals = T)
+
+(rE_Fixed_FitSumm5<-summary(rE_Fixed_Fit5,verbose=T))
+
+
+rbind(mxCompare(ACEFit1,rE_Fixed_Fit1),
+      mxCompare(ACEFit1,rE_Fixed_Fit2)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit3)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit4)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit5)[2,])
+
+
+rbind(ACESum1$CI[2,],
+      rE_Fixed_FitSumm1$CI,
+      rE_Fixed_FitSumm2$CI,
+      rE_Fixed_FitSumm3$CI,
+      rE_Fixed_FitSumm4$CI,
+      rE_Fixed_FitSumm5$CI)
+
+
+rbind(mxEval(MZ2.stG1,rE_Fixed_Fit1),
+      mxEval(MZ2.stG1,rE_Fixed_Fit2),
+      mxEval(MZ2.stG1,rE_Fixed_Fit3),
+      mxEval(MZ2.stG1,rE_Fixed_Fit4),
+      mxEval(MZ2.stG1,rE_Fixed_Fit5))
+
+mxEval(MZ2.stG1,rE_Fixed_Fit1);mxEval(MZ2.stG1,rE_Fixed_Fit2);mxEval(MZ2.stG1,rE_Fixed_Fit3);mxEval(MZ2.stG1,rE_Fixed_Fit4);mxEval(MZ2.stG1,rE_Fixed_Fit5)
+
+## save the results as RData
+save.image("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv5_cMFQ_NSSH_20_April_2021.RData")
+load("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv5_cMFQ_NSSH_20_April_2021.RData")
+
+```
+
+### cMFQ-SSH
+```{r cMFQ-SSH, eval=FALSE}
+#******************************************************
+
+###### Regress out age, sex and transform cMFQ variable #####
+merged_data$res_basic_cMFQ1<- residuals(lm(merged_data$pcbhmfqt1
+                                           ~merged_data$age_161 + merged_data$sex1,
+                                           na.action="na.exclude"))
+merged_data$res_trans_order_cMFQ1 <-log(merged_data$res_basic_cMFQ1+6)*2
+
+#do same thing for twin 2. 
+merged_data$res_basic_cMFQ2<- residuals(lm(merged_data$pcbhmfqt2
+                                           ~merged_data$age_162 + merged_data$sex2,
+                                           na.action="na.exclude"))
+
+merged_data$res_trans_order_cMFQ2 <-log(merged_data$res_basic_cMFQ2+6)*2
+
+#***************************************************************************************
+#################################### MR-DoC model ######################################
+#***************************************************************************************
+
+#variables I will need for this cMFQ MR-DoC model:
+vars		<-c('MDD_PRS','cMFQ','SH')
+
+#variables for the second ACE fit to compare results (residualised then transformed)
+selVars	<-c('MDD100_res_t1', 'res_trans_order_cMFQ1','SSH1',
+            'MDD100_res_t2', 'res_trans_order_cMFQ2','SSH2') 
+
+
+useVars	<-c('MDD100_res_t1', 'res_trans_order_cMFQ1','SSH1',
+            'MDD100_res_t2', 'res_trans_order_cMFQ2','SSH2',
+            'age1', 'age2', 'sex1','sex2') #age is for at age 21
+
+#need to recode missing age into 999
+table(is.na(merged_data$age1))
+merged_data$SSH1[is.na(merged_data$age1)] <- NA
+merged_data$SSH2[is.na(merged_data$age2)] <- NA
+merged_data$age1[is.na(merged_data$age1)] <- 999
+merged_data$age2[is.na(merged_data$age2)] <- 999
+merged_data[1:20,1:8]
+
+#mz and dzdata for using res_trans_order_cMFQ
+mzdata<-subset(merged_data, zygos%in%1&random==1 , useVars)
+dzdata<-subset(merged_data, zygos%in%2&random==1 , useVars)
+
+
+
+head(mzdata)
+
+#do ACE model #
+nv			<- 3				# number of variables for a twin = 1 in Univariate
+nvo 			<- 1     			#number of ordinal variables per twin
+nvc 			<- nv-nvo  			#number of continuous variables per twin
+poso 			<- nvo 			#position where ordinal variables start
+ntv			<- 2*nv			# number of variables for a pair = 2* 1 for Univariate
+nth			<- 4	# number of max thresholds
+nfact		<- 3				# number of Latent Factors
+ncor			<- (nv*(nv+1)/2)-nv	# number of free elements in a correlation matrix nv*nv
+ninc 			<- nth-1 			#number of max increments
+ncovariates 	<- 2 				#number of covariates
+
+
+# Define definition variables to hold the Covariates
+
+obsAge1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age1"), name="Age1")
+obsAge2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age2"), name="Age2")
+obsSex1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex1"), name="Sex1")
+obsSex2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex2"), name="Sex2")
+
+#effect of age and sex on ordinal variable
+LabCovA	<-c('BageThSSH', 'BageThSSH','BageThSSH', 'BageThSSH')
+LabCovS <-c('BsexThSSH', 'BsexThSSH','BsexThSSH', 'BsexThSSH')
+
+betaA		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovA, name="BageTH" )
+betaS		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovS, name="BsexTH" )
+
+#mean matrix, set NSSH to NA and fixed
+StMZmean=c(colMeans(mzdata[,1:2],na.rm=TRUE),0)
+Mean	<-mxMatrix( "Full", 1, ntv, free=c(T,T,F,T,T,F), values=StMZmean, labels=c("mPGS", 'mcMFQ',NA, "mPGS", 'mcMFQ',NA), name="ExpMean" )
+
+
+#Threshold matrix
+StTH		<-c(-1,0.1,0.1,0.1)
+LabTh	<-c('Tmz_11','imz_11','imz_12','imz_13')
+Tr		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=StTH, lbound=c(-4,0.001,0.001,0.001), ubound=c(4,4),
+                labels=LabTh, name="Th")
+
+inc		<-mxMatrix( type="Lower",nrow=nth, ncol=nth, free=F, values=1, name="Low")
+
+Thres	<-mxAlgebra( expression= cbind(Low%*%Th + BageTH%x%Age1 + BsexTH%x%Sex1,
+                                     Low%*%Th + BageTH%x%Age2 + BsexTH%x%Sex2),
+                   name="ExpThres")
+
+#Matrix that holds loadings from observed to latent variables
+PatFl	<- c(F,F,F,
+           F,F,F,
+           F,F,F) # Fix observed to latent to be 1 for all variables
+StFl		<- c(1,0,0,
+           0,1,0,
+           0,0,1)
+LabFl	<- c('PGS',NA,NA,
+           NA,'X',NA,
+           NA, NA,'Y')
+Load		<-mxMatrix(type="Full",	nrow=nv, ncol=nfact, free=PatFl, values=StFl, labels=LabFl, name="Loadings" )
+Id2		<-mxMatrix(type="Iden",	nrow=2, ncol=2, free=F, name="I2" )
+LoadTw	<-mxAlgebra(I2%x%Loadings, name="FactLTw") #this will be a 2*nv x 2*nfact matrix,making it possible for both twins
+
+#beta matrix to hold causal relationships
+# Define the matrix to hold the Single headed Arrows (causal paths) between the 3 latent variables
+# NB: direction of causation goes DOWN the column & OUT along the row
+PatPhC<-c(F,T,T,
+          F,F,T,
+          F,F,F)
+StPhC<-c(0,0.05,0.05,
+         0,0,0.05,
+         0,0,0)
+LabPhC<-c(NA,"PGS_to_X","PGS_to_Y",
+          NA,NA,"X_to_Y",
+          NA,NA,NA)
+PhCaus	<-mxMatrix(type="Full",	nrow=nfact, ncol=nfact, free=PatPhC, values=StPhC, labels=LabPhC, name="PhC" )
+
+### Build the ACE components
+# Define the matrices to hold the A and C effects: Common (upper) 
+LabAc<-c("Ax","Axy","Ay")
+freeA<-c(T,T,T)
+stA<-c(0.5,0.5,0.5)
+
+LabCc<-c("Cx","Cxy","Cy")
+freeC<-c(T,F,F)
+stC<-c(0.5,0,0)
+
+LabEc<-c("Ex","Exy","Ey")
+freeE<-c(T,F,T)
+stE<-c(0.5,0,0.5)
+
+
+
+PathsAc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeA, values=stA, labels=LabAc , name="ac" )
+PathsCc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeC, values=stC, labels=LabCc , name="cc" )
+PathsEc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeE, values=stE, labels=LabEc , name="ec" )
+covAc		<-mxAlgebra( expression= ac %*% t(ac), name="Ac" ) #cannot parse PGS variance into ACE
+covCc		<-mxAlgebra( expression= cc %*% t(cc), name="Cc" ) #use these for standardisation.
+covEc		<-mxAlgebra( expression= ec %*% t(ec), name="Ec" )
+covPc		<-mxAlgebra( expression= Ac+Cc+Ec, name="Vc" ) #use a 2 x 2 matrix only. 
+MZcovPc		<-mxAlgebra( expression= Ac+Cc, name="MZVc" )
+DZcovPc		<-mxAlgebra( expression= 0.5%x%Ac+Cc, name="DZVc" )
+
+#then specify var for PGS with a unit matrix (freely estimated)
+PGSpath	<-mxMatrix(type="Full", nrow=1, ncol=1, free=T, values=0.5, labels="PGS_sd" , name="PGSp" )
+PGSvar<-mxAlgebra(expression=PGSp%*%t(PGSp),name="varPGS") #this will be the double headed arrow for variance of PGS
+
+#zero matrices
+zeromat<-mxMatrix(type="Zero",nrow=2,ncol=1,free=F,name="zero")
+zeromat2<-mxMatrix(type="Zero",nrow=1,ncol=2,free=F,name="zero2")
+
+totV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,Vc)),name="total_var")#if it complains, switch rbind and cbind.
+#matrix above is a 3 x 3 matrix, within-twin matrix 
+totMZV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,MZVc)),name="MZ_covar") #this is between person
+totDZV<-mxAlgebra(expression=cbind(rbind(0.5%x%varPGS,zero),rbind(zero2,DZVc)),name="DZ_covar")
+
+# Generate Covariance of Latent factor model Including Causal Paths between factors
+Id3		<-mxMatrix(type="Iden",	nrow=nfact, ncol=nfact, name="I3" )
+
+covFV	<-mxAlgebra( expression= solve(I3-PhC) %&% total_var, name ="FV") #(I4-PhC) gives the expression for the removal of the loop effect of causal relationships between the factors (1-4).
+covMZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% MZ_covar, name ="MZFV") #(I4-PhC) gives the expression for the removal of the loop effect of causal relationships between the factors (1-4).
+covDZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% DZ_covar, name ="DZFV") #(I4-PhC) gives the expression for the removal of the loop effect of causal relationships between the factors (1-4).
+
+
+# Constraint on total variance of Ordinal variable (A+C+E=1)
+varL		<- mxConstraint( expression=FV[3,3]==1, name="L" ) #total variablity after taking into account for causal effects
+
+# Var-Cov of measured vars in terms of latent factors and AC, Cc, and Ec
+#this results in a 6x6 matrix
+
+covMZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, MZFV), cbind(MZFV, FV) )) , name="expCovMZ" )#This traces the path from vars to factors and back to vars
+covDZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, DZFV), cbind(DZFV, FV) )) , name="expCovDZ" )
+
+
+# Algebra to compute standardized variance components
+#generate a 2x2 matrix which has taken into account for causal effects from FV:
+Var2by2<-mxAlgebra(expression=FV[2:3,2:3],name="FV2by2")
+StA	<- mxAlgebra( expression=Ac/FV2by2, name="h2")
+StC	<- mxAlgebra( expression=Cc/FV2by2, name="c2")
+StE	<- mxAlgebra( expression=Ec/FV2by2, name="e2")
+
+# # Algebra to compute Phenotypic, A, C & E correlations for exposure and outcome
+matI	<- mxMatrix( type="Iden", nrow=nv-1, ncol=nv-1, name="I2")
+rph	<- mxAlgebra( expression= solve(sqrt(I3*FV)) %*% FV %*% solve(sqrt(I3*FV)), name="Rph")#get overall Rph
+rAc	<- mxAlgebra( expression= solve(sqrt(I2*Ac)) %*% Ac %*% solve(sqrt(I2*Ac)), name="Rac" )
+
+
+
+# Algebra to get standardised b1, b2 and g1 paths:
+beta1=mxAlgebra(expression= (PhC[2,1]*sqrt(FV[1,1]))/(sqrt(FV[2,2])), name="stB1")
+beta2=mxAlgebra(expression= (PhC[3,2]*sqrt(FV[2,2]))/(sqrt(FV[3,3])), name="stG1")
+pleio=mxAlgebra(expression= (PhC[3,1]*sqrt(FV[1,1]))/(sqrt(FV[3,3])), name="stB2")
+
+
+#algebra to get RPh due to A,C,E and causal effects: 
+RphACE<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                   stg1*stB1, stb2),name="ACErph")
+
+# Data objects for Multiple Groups
+dataMZ	<- mxData( observed=mzdata, type="raw" )
+dataDZ	<- mxData( observed=dzdata, type="raw" )
+
+
+# Objective objects for Multiple Groups
+objMZ		<- mxExpectationNormal( covariance="expCovMZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("SSH1","SSH2") )
+objDZ		<- mxExpectationNormal( covariance="expCovDZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("SSH1","SSH2") )
+
+fitFunction <- mxFitFunctionML()
+
+# Combine Groups
+
+pars<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+           covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+           StA,StC,StE,matI,rph,rAc,beta1,beta2,pleio,Var2by2,RphACE)
+
+modelMZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ" )
+modelDZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ" )
+
+
+minus2ll	<-mxAlgebra( expression=MZ.objective + DZ.objective, name="m2LL" )
+obj		<-mxFitFunctionAlgebra( "m2LL" )
+
+ACEModel	<-mxModel("ACE", pars, modelMZ, modelDZ, minus2ll, obj)
+
+#### run the ACE model which already has the parameters set or constrained: 
+ACEFit		<-mxTryHardOrdinal(ACEModel, intervals=F)
+(ACESum	<- summary(ACEFit))
+
+tableMZ<-as.table(mxEval(MZ.expCovMZ,ACEFit))
+colnames(tableMZ)<-c("PGS1","cMFQ1","SSH1","PGS2","cMFQ2","SSH2")
+rownames(tableMZ)<-c("PGS1","cMFQ1","SSH1","PGS2","cMFQ2","SSH2")
+round(tableMZ,3)
+
+tableDZ<-as.table(mxEval(DZ.expCovDZ,ACEFit))
+colnames(tableDZ)<-c("PGS1","cMFQ1","SSH1","PGS2","cMFQ2","SSH2")
+rownames(tableDZ)<-c("PGS1","cMFQ1","SSH1","PGS2","cMFQ2","SSH2")
+round(tableDZ,3)
+
+mxEval(MZ.stB1,ACEFit);mxEval(MZ.stG1,ACEFit);mxEval(MZ.stB2,ACEFit)
+
+pathsCI1	<-mxCI (c ('MZ.stB1','MZ.stG1','MZ.stB2'))
+pathsCI2<-mxCI(c('MZ.h2[1,1]','MZ.c2[1,1]','MZ.e2[1,1]',
+                 'MZ.h2[2,2]','MZ.e2[2,2]'))
+pathsCI3<-mxCI(c('MZ.Rac[2,1]','MZ.Rph[3,2]',
+                 'MZ.ACErph[1,1]','MZ.ACErph[1,2]','MZ.ACErph[1,3]'))
+
+#CI1
+ACEModel1<-mxModel(ACEFit,pathsCI1)
+ACEFit1<-mxRun(ACEModel1,intervals=T)
+(ACESum1	<- summary(ACEFit1))
+
+#CI2
+ACEModel2<-mxModel(ACEFit,pathsCI2)
+ACEFit2<-mxRun(ACEModel2,intervals=T)
+(ACESum2	<- summary(ACEFit2))
+
+#CI3
+ACEModel3<-mxModel(ACEFit,pathsCI3)
+ACEFit3<-mxRun(ACEModel3,intervals=T)
+(ACESum3	<- summary(ACEFit3))
+
+
+sum(mxEval(MZ.ACErph[1:3],ACEFit))
+
+ACESum1$CI
+ACESum2$CI
+ACESum3$CI
+
+
+##### create full bivariate model without direction of causation for comparison #####
+## re = True, stG1= False
+FullBiMod<-mxModel(ACEFit,name="Full_Bi")
+FullBiMod<-omxSetParameters(FullBiMod, labels=c("Exy","X_to_Y"), free=c(TRUE,FALSE),values=c(0.5,0))
+FullBiFit<-mxRun(FullBiMod, intervals=F)
+(FullBiSum<-summary(FullBiFit,verbose=T))
+#check re
+Ec<-mxEval(MZ.Ec,FullBiFit)
+Itwo<-mxEval(MZ.I2,FullBiFit)
+(Rec<-solve(sqrt(Itwo*Ec)) %*% Ec %*% solve(sqrt(Itwo*Ec)))
+
+#check G1 (the causal effect)
+mxEval(MZ.stG1,FullBiFit)
+
+#other values
+mxEval(MZ.stB1,FullBiFit)
+mxEval(MZ.stB2,FullBiFit)
+mxEval(MZ.h2,FullBiFit);mxEval(MZ.c2,FullBiFit);mxEval(MZ.e2,FullBiFit)
+mxEval(MZ.Rac,FullBiFit)
+mxEval(MZ.Rph,FullBiFit)
+
+#get Rcc
+Cc<-mxEval(MZ.Cc,FullBiFit)
+(Rcc<-solve(sqrt(Itwo*Cc)) %*% Cc %*% solve(sqrt(Itwo*Cc)))
+# compare the two models
+mxCompare(FullBiFit,ACEFit)
+
+## now run model without effect of PRS only but still with stb2 and rc,re dropped ###
+DoC_Mod<-mxModel(ACEFit,name="DOC")
+DoC_Mod<-omxSetParameters(DoC_Mod, labels=c("PGS_to_X","PGS_to_Y"), free=c(F,F),values=c(0,0))
+DoC_Fit<-mxRun(DoC_Mod, intervals=F)
+(DoCSum<-summary(DoC_Fit,verbose=T))
+
+#check PGS effect
+mxEval(MZ.stB1,DoC_Fit);mxEval(MZ.stB2,DoC_Fit)
+#values for the path diagram
+mxEval(MZ.stG1,DoC_Fit)
+mxEval(MZ.h2,DoC_Fit);mxEval(MZ.c2,DoC_Fit);mxEval(MZ.e2,DoC_Fit)
+mxEval(MZ.Rac,DoC_Fit)
+mxEval(MZ.Rph,DoC_Fit)
+mxEval(MZ.expCovMZ,DoC_Fit);mxEval(DZ.expCovDZ,DoC_Fit)
+#compare the models
+mxCompare(ACEFit,DoC_Fit)
+
+
+
+##### sensitivity analysis: what if rE is not zero, e.g. fixed to 0.20? #####
+#add re into the model
+rEc	<- mxAlgebra( expression= solve(sqrt(I2*Ec)) %*% Ec %*% solve(sqrt(I2*Ec)), name="Rec" )
+RphACE2<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                    #(sqrt(c2[1,1])*Rcc[2,1]*sqrt(c2[2,2])),
+                                    (sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), 
+                                    stB2*stB1, stG1),name="ACErph2")
+pars2<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+            covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+            StA,StC,StE,matI,rph,rAc,rEc,beta1,beta2,pleio,Var2by2,RphACE2)
+
+modelMZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ2" )
+modelDZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ2" )
+minus2ll2	<-mxAlgebra( expression=MZ2.objective + DZ2.objective, name="m2LL2" )
+obj2		<-mxFitFunctionAlgebra( "m2LL2" )
+rE_fixed_Model	<-mxModel("rE_fixed", pars2, modelMZ2, modelDZ2, minus2ll2, obj2)
+rE_fixed_Model <-omxSetParameters(rE_fixed_Model, labels=c("Exy", "X_to_Y"), free=c(T,T),values=c(0.5,0.2))
+
+pathsCI_rEfix	<-mxCI (c ('MZ2.stG1'))
+#re = 0.05
+rE_fixed_Model005<-mxModel(rE_fixed_Model,name="rE_fixed",
+                           mxConstraint(MZ2.Rec[1,2]==0.05, name="con1"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit1		<- mxTryHardOrdinal(rE_fixed_Model005, intervals = T)
+
+(rE_Fixed_FitSumm1<-summary(rE_Fixed_Fit1,verbose=T))
+mxEval(MZ2.stb2,rE_Fixed_Fit1)
+mxEval(MZ2.Rec,rE_Fixed_Fit1)
+
+## re=0.10
+rE_fixed_Model010<-mxModel(rE_fixed_Model,name="rE_fixed2",
+                           mxConstraint(MZ2.Rec[1,2]==0.10, name="con2"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit2		<- mxTryHardOrdinal(rE_fixed_Model010, intervals = T)
+
+(rE_Fixed_FitSumm2<-summary(rE_Fixed_Fit2,verbose=T))
+
+## re=0.15
+rE_fixed_Model015<-mxModel(rE_fixed_Model,name="rE_fixed3",
+                           mxConstraint(MZ2.Rec[1,2]==0.15, name="con3"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit3		<- mxTryHardOrdinal(rE_fixed_Model015, intervals = T)
+
+(rE_Fixed_FitSumm3<-summary(rE_Fixed_Fit3,verbose=T))
+
+## re=0.20
+rE_fixed_Model020<-mxModel(rE_fixed_Model,name="rE_fixed4",
+                           mxConstraint(MZ2.Rec[1,2]==0.20, name="con4"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit4		<- mxTryHardOrdinal(rE_fixed_Model020, intervals = T)
+
+(rE_Fixed_FitSumm4<-summary(rE_Fixed_Fit4,verbose=T))
+
+## re=0.25
+rE_fixed_Model025<-mxModel(rE_fixed_Model,name="rE_fixed5",
+                           mxConstraint(MZ2.Rec[1,2]==0.25, name="con5"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit5		<- mxTryHardOrdinal(rE_fixed_Model025, intervals = T)
+
+(rE_Fixed_FitSumm5<-summary(rE_Fixed_Fit5,verbose=T))
+
+
+rbind(mxCompare(ACEFit1,rE_Fixed_Fit1),
+      mxCompare(ACEFit1,rE_Fixed_Fit2)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit3)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit4)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit5)[2,])
+
+rbind(mxEval(MZ2.stG1,rE_Fixed_Fit1),
+      mxEval(MZ2.stG1,rE_Fixed_Fit2),
+      mxEval(MZ2.stG1,rE_Fixed_Fit3),
+      mxEval(MZ2.stG1,rE_Fixed_Fit4),
+      mxEval(MZ2.stG1,rE_Fixed_Fit5))
+
+rbind(ACESum1$CI[2,],
+      rE_Fixed_FitSumm1$CI,
+      rE_Fixed_FitSumm2$CI,
+      rE_Fixed_FitSumm3$CI,
+      rE_Fixed_FitSumm4$CI,
+      rE_Fixed_FitSumm5$CI)
+
+## save the results as RData
+save.image("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv5_cMFQ_SSH_20_April_2021.RData")
+load("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv3_cMFQ_SSH_08_April_2021.RData")
+
+```
+
+### pCONN-NSSH
+```{r pCONN-NSSH, eval=FALSE}
+#******************************************************
+
+###### Regress out age, sex and transform pCONN variable #####
+#residualise first, then tranform
+merged_data$res_basic_pCONN1<- residuals(lm(merged_data$ppbhconnt1
+                                            ~merged_data$age_161 + merged_data$sex1,
+                                            na.action="na.exclude"))
+merged_data$res_trans_order_pCONN1 <-log(merged_data$res_basic_pCONN1+10)*2
+
+#do same thing for twin 2. 
+merged_data$res_basic_pCONN2<- residuals(lm(merged_data$ppbhconnt2
+                                            ~merged_data$age_162 + merged_data$sex2,
+                                            na.action="na.exclude"))
+
+merged_data$res_trans_order_pCONN2 <-log(merged_data$res_basic_pCONN2+10)*2
+#***************************************************************************************
+#################################### MR-DoC model ######################################
+#***************************************************************************************
+
+#variables I will need for this pCONN MR-DoC model:
+vars		<-c('ADHD_PRS','pCONN','SH')
+selVars	<-c('ADHD100_res_t1', 'res_trans_order_pCONN1','NSSH1',
+            'ADHD100_res_t2', 'res_trans_order_pCONN2','NSSH2')
+
+useVars	<-c('ADHD100_res_t1', 'res_trans_order_pCONN1','NSSH1',
+            'ADHD100_res_t2', 'res_trans_order_pCONN2','NSSH2',
+            'age1', 'age2', 'sex1','sex2') #age is for at age 21
+
+
+#need to recode missing age into 999
+table(is.na(merged_data$age1))
+merged_data$NSSH1[is.na(merged_data$age1)] <- NA
+merged_data$NSSH2[is.na(merged_data$age2)] <- NA
+merged_data$age1[is.na(merged_data$age1)] <- 999
+merged_data$age2[is.na(merged_data$age2)] <- 999
+merged_data[1:20,1:8]
+
+#mz and dzdata for using res_trans_order_pCONN
+mzdata<-subset(merged_data, zygos%in%1&random==1 , useVars)
+dzdata<-subset(merged_data, zygos%in%2&random==1 , useVars)
+
+
+head(mzdata)
+
+#do ACE model #
+nv			<- 3				# number of variables for a twin = 1 in Univariate
+nvo 			<- 1     			#number of ordinal variables per twin
+nvc 			<- nv-nvo  			#number of continuous variables per twin
+poso 			<- nvo 			#position where ordinal variables start
+ntv			<- 2*nv			# number of variables for a pair = 2* 1 for Univariate
+nth			<- 4	# number of max thresholds
+nfact		<- 3				# number of Latent Factors
+ncor			<- (nv*(nv+1)/2)-nv	# number of free elements in a correlation matrix nv*nv
+ninc 			<- nth-1 			#number of max increments
+ncovariates 	<- 2 				#number of covariates
+
+
+# Define definition variables to hold the Covariates
+
+obsAge1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age1"), name="Age1")
+obsAge2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age2"), name="Age2")
+obsSex1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex1"), name="Sex1")
+obsSex2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex2"), name="Sex2")
+
+#effect of age and sex on ordinal variable
+LabCovA	<-c('BageThNSSH', 'BageThNSSH','BageThNSSH', 'BageThNSSH')
+LabCovS <-c('BsexThNSSH', 'BsexThNSSH','BsexThNSSH', 'BsexThNSSH')
+
+betaA		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovA, name="BageTH" )
+betaS		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovS, name="BsexTH" )
+
+#mean matrix, set NSSH to NA and fixed
+StMZmean=c(colMeans(mzdata[,1:2],na.rm=TRUE),0)
+Mean	<-mxMatrix( "Full", 1, ntv, free=c(T,T,F,T,T,F), values=StMZmean, labels=c("mPGS", 'mpCONN',NA, "mPGS", 'mpCONN',NA), name="ExpMean" )
+
+
+#Threshold matrix
+StTH		<-c(-1,0.1,0.1,0.1)
+LabTh	<-c('Tmz_11','imz_11','imz_12','imz_13')
+Tr		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=StTH, lbound=c(-4,0.001,0.001,0.001), ubound=c(4,4),
+                labels=LabTh, name="Th")
+
+inc		<-mxMatrix( type="Lower",nrow=nth, ncol=nth, free=F, values=1, name="Low")
+
+Thres	<-mxAlgebra( expression= cbind(Low%*%Th + BageTH%x%Age1 + BsexTH%x%Sex1,
+                                     Low%*%Th + BageTH%x%Age2 + BsexTH%x%Sex2),
+                   name="ExpThres")
+
+#Matrix that holds loadings from observed to latent variables
+PatFl	<- c(F,F,F,
+           F,F,F,
+           F,F,F) # Fix observed to latent to be 1 for all variables
+StFl		<- c(1,0,0,
+           0,1,0,
+           0,0,1)
+LabFl	<- c('PGS',NA,NA,
+           NA,'X',NA,
+           NA, NA,'Y')
+Load		<-mxMatrix(type="Full",	nrow=nv, ncol=nfact, free=PatFl, values=StFl, labels=LabFl, name="Loadings" )
+Id2		<-mxMatrix(type="Iden",	nrow=2, ncol=2, free=F, name="I2" )
+LoadTw	<-mxAlgebra(I2%x%Loadings, name="FactLTw") #this will be a 2*nv x 2*nfact matrix,making it possible for both twins
+
+#beta matrix to hold causal relationships
+# Define the matrix to hold the Single headed Arrows (causal paths) between the 3 latent variables
+# NB: direction of causation goes DOWN the column & OUT along the row
+PatPhC<-c(F,T,T,
+          F,F,T,
+          F,F,F)
+StPhC<-c(0,0.05,0.05,
+         0,0,0.05,
+         0,0,0)
+LabPhC<-c(NA,"PGS_to_X","PGS_to_Y",
+          NA,NA,"X_to_Y",
+          NA,NA,NA)
+PhCaus	<-mxMatrix(type="Full",	nrow=nfact, ncol=nfact, free=PatPhC, values=StPhC, labels=LabPhC, name="PhC" )
+
+### Build the ACE components
+# Define the matrices to hold the A and C effects: Common (upper) 
+LabAc<-c("Ax","Axy","Ay")
+freeA<-c(T,T,T)
+stA<-c(0.5,0.5,0.5)
+
+LabCc<-c("Cx","Cxy","Cy")
+freeC<-c(T,F,F)
+stC<-c(0.5,0,0)
+
+LabEc<-c("Ex","Exy","Ey")
+freeE<-c(T,F,T)
+stE<-c(0.5,0,0.5)
+
+
+
+PathsAc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeA, values=stA, labels=LabAc , name="ac" )
+PathsCc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeC, values=stC, labels=LabCc , name="cc" )
+PathsEc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeE, values=stE, labels=LabEc , name="ec" )
+covAc		<-mxAlgebra( expression= ac %*% t(ac), name="Ac" ) #cannot parse PGS variance into ACE
+covCc		<-mxAlgebra( expression= cc %*% t(cc), name="Cc" ) #use these for standardisation.
+covEc		<-mxAlgebra( expression= ec %*% t(ec), name="Ec" )
+covPc		<-mxAlgebra( expression= Ac+Cc+Ec, name="Vc" ) #use a 2 x 2 matrix only. 
+
+
+MZcovPc		<-mxAlgebra( expression= Ac+Cc, name="MZVc" )
+DZcovPc		<-mxAlgebra( expression= 0.5%x%Ac+Cc, name="DZVc" )
+
+#then specify var for PGS with a unit matrix (freely estimated)
+PGSpath	<-mxMatrix(type="Full", nrow=1, ncol=1, free=T, values=0.5, labels="PGS_sd" , name="PGSp" )
+PGSvar<-mxAlgebra(expression=PGSp%*%t(PGSp),name="varPGS") #this will be the double headed arrow for variance of PGS
+
+#zero matrices
+zeromat<-mxMatrix(type="Zero",nrow=2,ncol=1,free=F,name="zero")
+zeromat2<-mxMatrix(type="Zero",nrow=1,ncol=2,free=F,name="zero2")
+
+totV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,Vc)),name="total_var")#if it complains, switch rbind and cbind.
+#matrix above is a 3 x 3 matrix, within-twin matrix 
+totMZV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,MZVc)),name="MZ_covar") #this is between person
+totDZV<-mxAlgebra(expression=cbind(rbind(0.5%x%varPGS,zero),rbind(zero2,DZVc)),name="DZ_covar")
+
+# Generate Covariance of Latent factor model Including Causal Paths between factors
+Id3		<-mxMatrix(type="Iden",	nrow=nfact, ncol=nfact, name="I3" )
+
+covFV	<-mxAlgebra( expression= solve(I3-PhC) %&% total_var, name ="FV") #(I3-PhC) gives the expression for the removal of the loop effect of causal relationships between the factors (1-4).
+covMZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% MZ_covar, name ="MZFV") 
+covDZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% DZ_covar, name ="DZFV") 
+
+# Constraint on total variance of Ordinal variable (A+C+E=1)
+varL		<- mxConstraint( expression=FV[3,3]==1, name="L" ) #total variablity after taking into account for causal effects
+
+# Var-Cov of measured vars in terms of latent factors and AC, Cc, and Ec
+#this results in a 6x6 matrix
+
+covMZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, MZFV), cbind(MZFV, FV) )) , name="expCovMZ" )#This traces the path from vars to factors and back to vars
+covDZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, DZFV), cbind(DZFV, FV) )) , name="expCovDZ" )
+
+
+# Algebra to compute standardized variance components
+#generate a 2x2 matrix which has taken into account for causal effects from FV:
+Var2by2<-mxAlgebra(expression=FV[2:3,2:3],name="FV2by2")
+StA	<- mxAlgebra( expression=Ac/FV2by2, name="h2")
+StC	<- mxAlgebra( expression=Cc/FV2by2, name="c2")
+StE	<- mxAlgebra( expression=Ec/FV2by2, name="e2")
+
+# # Algebra to compute Phenotypic, A, C & E correlations for exposure and outcome
+matI	<- mxMatrix( type="Iden", nrow=nv-1, ncol=nv-1, name="I2")
+rph	<- mxAlgebra( expression= solve(sqrt(I3*FV)) %*% FV %*% solve(sqrt(I3*FV)), name="Rph")#get overall Rph
+rAc	<- mxAlgebra( expression= solve(sqrt(I2*Ac)) %*% Ac %*% solve(sqrt(I2*Ac)), name="Rac" )
+
+
+# Algebra to get standardised b1, b2 and g1 paths:
+beta1=mxAlgebra(expression= (PhC[2,1]*sqrt(FV[1,1]))/(sqrt(FV[2,2])), name="stB1")
+beta2=mxAlgebra(expression= (PhC[3,2]*sqrt(FV[2,2]))/(sqrt(FV[3,3])), name="stG1")
+pleio=mxAlgebra(expression= (PhC[3,1]*sqrt(FV[1,1]))/(sqrt(FV[3,3])), name="stB2")
+
+
+#algebra to get RPh due to A,C,E and causal effects: 
+RphACE<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                   #(sqrt(c2[1,1])*Rcc[2,1]*sqrt(c2[2,2])),
+                                   #(sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), #this should be zero because re will be fixed to zero.
+                                   stB2*stB1, stG1),name="ACErph")
+
+# Data objects for Multiple Groups
+dataMZ	<- mxData( observed=mzdata, type="raw" )
+dataDZ	<- mxData( observed=dzdata, type="raw" )
+
+
+# Objective objects for Multiple Groups
+objMZ		<- mxExpectationNormal( covariance="expCovMZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("NSSH1","NSSH2") )
+objDZ		<- mxExpectationNormal( covariance="expCovDZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("NSSH1","NSSH2") )
+
+fitFunction <- mxFitFunctionML()
+
+# Combine Groups
+
+pars<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+           covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+           StA,StC,StE,matI,rph,rAc,beta1,beta2,pleio,Var2by2,RphACE)
+
+modelMZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ" )
+modelDZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ" )
+
+
+minus2ll	<-mxAlgebra( expression=MZ.objective + DZ.objective, name="m2LL" )
+obj		<-mxFitFunctionAlgebra( "m2LL" )
+
+ACEModel	<-mxModel("ACE", pars, modelMZ, modelDZ, minus2ll, obj)
+
+#### run the ACE model which already has the parameters set or constrained: 
+ACEFit		<-mxTryHardOrdinal(ACEModel, intervals=F)
+(ACESum	<- summary(ACEFit))
+mxEval(MZ.ExpMean,ACEFit)
+
+tableMZ<-as.table(mxEval(MZ.expCovMZ,ACEFit))
+colnames(tableMZ)<-c("PGS1","pCONN1","NSSH1","PGS2","pCONN2","NSSH2")
+rownames(tableMZ)<-c("PGS1","pCONN1","NSSH1","PGS2","pCONN2","NSSH2")
+round(tableMZ,3)
+
+tableDZ<-as.table(mxEval(DZ.expCovDZ,ACEFit))
+colnames(tableDZ)<-c("PGS1","pCONN1","NSSH1","PGS2","pCONN2","NSSH2")
+rownames(tableDZ)<-c("PGS1","pCONN1","NSSH1","PGS2","pCONN2","NSSH2")
+round(tableDZ,3)
+
+mxEval(MZ.stB1,ACEFit)
+
+pathsCI1	<-mxCI (c ('MZ.stB1','MZ.stG1','MZ.stB2'))
+pathsCI2<-mxCI(c('MZ.h2[1,1]','MZ.c2[1,1]','MZ.e2[1,1]',
+                 'MZ.h2[2,2]','MZ.e2[2,2]'))
+pathsCI3<-mxCI(c('MZ.Rac[2,1]','MZ.Rph[3,2]',
+                 'MZ.ACErph[1,1]','MZ.ACErph[1,2]','MZ.ACErph[1,3]'))
+
+#CI1
+ACEModel1<-mxModel(ACEFit,pathsCI1)
+ACEFit1<-mxRun(ACEModel1,intervals=T)
+(ACESum1	<- summary(ACEFit1))
+
+#CI2
+ACEModel2<-mxModel(ACEFit,pathsCI2)
+ACEFit2<-mxRun(ACEModel2,intervals=T)
+(ACESum2	<- summary(ACEFit2))
+
+#CI3
+ACEModel3<-mxModel(ACEFit,pathsCI3)
+ACEFit3<-mxRun(ACEModel3,intervals=T)
+(ACESum3	<- summary(ACEFit3))
+
+
+sum(mxEval(MZ.ACErph[1:3],ACEFit))
+
+ACESum1$CI
+ACESum2$CI
+ACESum3$CI
+
+
+##### create full bivariate model without direction of causation for comparison #####
+## re = True, stb2= False
+FullBiMod<-mxModel(ACEFit,name="Full_Bi")
+FullBiMod<-omxSetParameters(FullBiMod, labels=c("Exy","X_to_Y"), free=c(T,F),values=c(0.5,0))
+FullBiFit<-mxRun(FullBiMod, intervals=F)
+(FullBiSum<-summary(FullBiFit,verbose=T))
+#check re
+Ec<-mxEval(MZ.Ec,FullBiFit)
+Itwo<-mxEval(MZ.I2,FullBiFit)
+(Rec<-solve(sqrt(Itwo*Ec)) %*% Ec %*% solve(sqrt(Itwo*Ec)))
+
+#check b2 (the causal effect)
+mxEval(MZ.stG1,FullBiFit)
+
+#other values
+mxEval(MZ.stB1,FullBiFit)
+mxEval(MZ.stB2,FullBiFit)
+mxEval(MZ.h2,FullBiFit);mxEval(MZ.c2,FullBiFit);mxEval(MZ.e2,FullBiFit)
+mxEval(MZ.Rac,FullBiFit)
+mxEval(MZ.Rph,FullBiFit)
+
+#get Rcc
+Cc<-mxEval(MZ.Cc,FullBiFit)
+(Rcc<-solve(sqrt(Itwo*Cc)) %*% Cc %*% solve(sqrt(Itwo*Cc)))
+# compare the two models
+mxCompare(FullBiFit,ACEFit)
+
+## now run model without effect of PRS only but still with stb2 and rc,re dropped ###
+DoC_Mod<-mxModel(ACEFit,name="DOC")
+DoC_Mod<-omxSetParameters(DoC_Mod, labels=c("PGS_to_X","PGS_to_Y"), free=c(F,F),values=c(0,0))
+DoC_Fit<-mxRun(DoC_Mod, intervals=F)
+(DoCSum<-summary(DoC_Fit,verbose=T))
+
+#check PGS effect
+mxEval(MZ.stB1,DoC_Fit);mxEval(MZ.stB2,DoC_Fit)
+#values for the path diagram
+mxEval(MZ.stG1,DoC_Fit)
+mxEval(MZ.h2,DoC_Fit);mxEval(MZ.c2,DoC_Fit);mxEval(MZ.e2,DoC_Fit)
+mxEval(MZ.Rac,DoC_Fit)
+mxEval(MZ.Rph,DoC_Fit)
+mxEval(MZ.expCovMZ,DoC_Fit);mxEval(DZ.expCovDZ,DoC_Fit)
+#compare the models
+mxCompare(ACEFit,DoC_Fit)
+
+
+##### sensitivity analysis: what if rE is not zero, e.g. fixed to 0.20? #####
+#add re into the model
+rEc	<- mxAlgebra( expression= solve(sqrt(I2*Ec)) %*% Ec %*% solve(sqrt(I2*Ec)), name="Rec" )
+RphACE2<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                    #(sqrt(c2[1,1])*Rcc[2,1]*sqrt(c2[2,2])),
+                                    (sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), 
+                                    stB2*stB1, stG1),name="ACErph2")
+pars2<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+            covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+            StA,StC,StE,matI,rph,rAc,rEc,beta1,beta2,pleio,Var2by2,RphACE2)
+
+modelMZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ2" )
+modelDZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ2" )
+minus2ll2	<-mxAlgebra( expression=MZ2.objective + DZ2.objective, name="m2LL2" )
+obj2		<-mxFitFunctionAlgebra( "m2LL2" )
+rE_fixed_Model	<-mxModel("rE_fixed", pars2, modelMZ2, modelDZ2, minus2ll2, obj2)
+rE_fixed_Model <-omxSetParameters(rE_fixed_Model, labels=c("Exy", "X_to_Y"), free=c(T,T),values=c(0.5,0.2))
+
+pathsCI_rEfix	<-mxCI (c ('MZ2.stG1'))
+#re = 0.05
+rE_fixed_Model005<-mxModel(rE_fixed_Model,name="rE_fixed",
+                           mxConstraint(MZ2.Rec[1,2]==0.05, name="con1"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit1		<- mxTryHardOrdinal(rE_fixed_Model005, intervals = T)
+
+(rE_Fixed_FitSumm1<-summary(rE_Fixed_Fit1,verbose=T))
+mxEval(MZ2.stb2,rE_Fixed_Fit1)
+mxEval(MZ2.Rec,rE_Fixed_Fit1)
+
+## re=0.10
+rE_fixed_Model010<-mxModel(rE_fixed_Model,name="rE_fixed2",
+                           mxConstraint(MZ2.Rec[1,2]==0.10, name="con2"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit2		<- mxTryHardOrdinal(rE_fixed_Model010, intervals = T)
+
+(rE_Fixed_FitSumm2<-summary(rE_Fixed_Fit2,verbose=T))
+
+## re=0.15
+rE_fixed_Model015<-mxModel(rE_fixed_Model,name="rE_fixed3",
+                           mxConstraint(MZ2.Rec[1,2]==0.15, name="con3"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit3		<- mxTryHardOrdinal(rE_fixed_Model015, intervals = T)
+
+(rE_Fixed_FitSumm3<-summary(rE_Fixed_Fit3,verbose=T))
+
+## re=0.20
+rE_fixed_Model020<-mxModel(rE_fixed_Model,name="rE_fixed4",
+                           mxConstraint(MZ2.Rec[1,2]==0.20, name="con4"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit4		<- mxTryHardOrdinal(rE_fixed_Model020, intervals = T)
+
+(rE_Fixed_FitSumm4<-summary(rE_Fixed_Fit4,verbose=T))
+
+## re=0.25
+rE_fixed_Model025<-mxModel(rE_fixed_Model,name="rE_fixed5",
+                           mxConstraint(MZ2.Rec[1,2]==0.25, name="con5"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit5		<- mxTryHardOrdinal(rE_fixed_Model025, intervals = T,extraTries=20)
+
+(rE_Fixed_FitSumm5<-summary(rE_Fixed_Fit5,verbose=T))
+
+
+rbind(mxCompare(ACEFit1,rE_Fixed_Fit1),
+      mxCompare(ACEFit1,rE_Fixed_Fit2)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit3)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit4)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit5)[2,])
+
+rbind(mxEval(MZ2.stG1,rE_Fixed_Fit1),
+      mxEval(MZ2.stG1,rE_Fixed_Fit2),
+      mxEval(MZ2.stG1,rE_Fixed_Fit3),
+      mxEval(MZ2.stG1,rE_Fixed_Fit4),
+      mxEval(MZ2.stG1,rE_Fixed_Fit5))
+
+
+rbind(ACESum1$CI[2,],
+      rE_Fixed_FitSumm1$CI,
+      rE_Fixed_FitSumm2$CI,
+      rE_Fixed_FitSumm3$CI,
+      rE_Fixed_FitSumm4$CI,
+      rE_Fixed_FitSumm5$CI)
+## save the results as RData
+save.image("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv5_pCONN_NSSH_20_April_2021.RData")
+load("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv3_pCONN_NSSH_08_April_2021.RData")
+
+```
+
+### pCONN-SSH
+```{r pCONN-SSH,  eval=FALSE}
+#******************************************************
+
+###### Regress out age, sex and transform pCONN variable #####
+
+#residualise first, then tranform
+merged_data$res_basic_pCONN1<- residuals(lm(merged_data$ppbhconnt1
+                                            ~merged_data$age_161 + merged_data$sex1,
+                                            na.action="na.exclude"))
+merged_data$res_trans_order_pCONN1 <-log(merged_data$res_basic_pCONN1+10)*2
+
+#do same thing for twin 2. 
+merged_data$res_basic_pCONN2<- residuals(lm(merged_data$ppbhconnt2
+                                            ~merged_data$age_162 + merged_data$sex2,
+                                            na.action="na.exclude"))
+
+merged_data$res_trans_order_pCONN2 <-log(merged_data$res_basic_pCONN2+10)*2
+#***************************************************************************************
+#################################### MR-DoC model ######################################
+#***************************************************************************************
+
+#variables I will need for this pCONN MR-DoC model:
+vars		<-c('ADHD_PRS','pCONN','SH')
+selVars	<-c('ADHD100_res_t1', 'res_trans_order_pCONN1','SSH1',
+            'ADHD100_res_t2', 'res_trans_order_pCONN2','SSH2')
+
+useVars	<-c('ADHD100_res_t1', 'res_trans_order_pCONN1','SSH1',
+            'ADHD100_res_t2', 'res_trans_order_pCONN2','SSH2',
+            'age1', 'age2', 'sex1','sex2') #age is for at age 21
+
+
+#need to recode missing age into 999
+table(is.na(merged_data$age1))
+merged_data$SSH1[is.na(merged_data$age1)] <- NA
+merged_data$SSH2[is.na(merged_data$age2)] <- NA
+merged_data$age1[is.na(merged_data$age1)] <- 999
+merged_data$age2[is.na(merged_data$age2)] <- 999
+merged_data[1:20,1:8]
+
+#mz and dzdata for using res_trans_order_cMFQ
+mzdata<-subset(merged_data, zygos%in%1&random==1 , useVars)
+dzdata<-subset(merged_data, zygos%in%2&random==1 , useVars)
+
+
+head(mzdata)
+
+#do ACE model #
+nv			<- 3				# number of variables for a twin = 1 in Univariate
+nvo 			<- 1     			#number of ordinal variables per twin
+nvc 			<- nv-nvo  			#number of continuous variables per twin
+poso 			<- nvo 			#position where ordinal variables start
+ntv			<- 2*nv			# number of variables for a pair = 2* 1 for Univariate
+nth			<- 4	# number of max thresholds
+nfact		<- 3				# number of Latent Factors 
+ncor			<- (nv*(nv+1)/2)-nv	# number of free elements in a correlation matrix nv*nv
+ninc 			<- nth-1 			#number of max increments
+ncovariates 	<- 2 				#number of covariates
+
+
+# Define definition variables to hold the Covariates
+
+obsAge1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age1"), name="Age1")
+obsAge2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age2"), name="Age2")
+obsSex1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex1"), name="Sex1")
+obsSex2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex2"), name="Sex2")
+
+#effect of age and sex on ordinal variable
+LabCovA	<-c('BageThSSH', 'BageThSSH','BageThSSH', 'BageThSSH')
+LabCovS <-c('BsexThSSH', 'BsexThSSH','BsexThSSH', 'BsexThSSH')
+
+betaA		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovA, name="BageTH" )
+betaS		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovS, name="BsexTH" )
+
+#mean matrix, set NSSH to NA and fixed
+StMZmean=c(colMeans(mzdata[,1:2],na.rm=TRUE),0)
+Mean	<-mxMatrix( "Full", 1, ntv, free=c(T,T,F,T,T,F), values=StMZmean, labels=c("mPGS", 'mpCONN',NA, "mPGS", 'mpCONN',NA), name="ExpMean" )
+
+
+#Threshold matrix
+StTH		<-c(-1,0.1,0.1,0.1)
+LabTh	<-c('Tmz_11','imz_11','imz_12','imz_13')
+Tr		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=StTH, lbound=c(-4,0.001,0.001,0.001), ubound=c(4,4),
+                labels=LabTh, name="Th")
+
+inc		<-mxMatrix( type="Lower",nrow=nth, ncol=nth, free=F, values=1, name="Low")
+
+Thres	<-mxAlgebra( expression= cbind(Low%*%Th + BageTH%x%Age1 + BsexTH%x%Sex1,
+                                     Low%*%Th + BageTH%x%Age2 + BsexTH%x%Sex2),
+                   name="ExpThres")
+
+#Matrix that holds loadings from observed to latent variables
+PatFl	<- c(F,F,F,
+           F,F,F,
+           F,F,F) # Fix observed to latent to be 1 for all variables
+StFl		<- c(1,0,0,
+           0,1,0,
+           0,0,1)
+LabFl	<- c('PGS',NA,NA,
+           NA,'X',NA,
+           NA, NA,'Y')
+Load		<-mxMatrix(type="Full",	nrow=nv, ncol=nfact, free=PatFl, values=StFl, labels=LabFl, name="Loadings" )
+Id2		<-mxMatrix(type="Iden",	nrow=2, ncol=2, free=F, name="I2" ) 
+LoadTw	<-mxAlgebra(I2%x%Loadings, name="FactLTw") #this will be a 2*nv x 2*nfact matrix,making it possible for both twins
+
+#beta matrix to hold causal relationships
+# Define the matrix to hold the Single headed Arrows (causal paths) between the 3 latent variables
+# NB: direction of causation goes DOWN the column & OUT along the row
+PatPhC<-c(F,T,T,
+          F,F,T,
+          F,F,F)
+StPhC<-c(0,0.05,0.05,
+         0,0,0.05,
+         0,0,0)
+LabPhC<-c(NA,"PGS_to_X","PGS_to_Y",
+          NA,NA,"X_to_Y",
+          NA,NA,NA)
+PhCaus	<-mxMatrix(type="Full",	nrow=nfact, ncol=nfact, free=PatPhC, values=StPhC, labels=LabPhC, name="PhC" )
+
+### Build the ACE components
+# Define the matrices to hold the A and C effects: Common (upper) 
+LabAc<-c("Ax","Axy","Ay")
+freeA<-c(T,T,T)
+stA<-c(0.5,0.5,0.5)
+
+LabCc<-c("Cx","Cxy","Cy")
+freeC<-c(T,F,F)
+stC<-c(0.5,0,0)
+
+LabEc<-c("Ex","Exy","Ey")
+freeE<-c(T,F,T)
+stE<-c(0.5,0,0.5)
+
+
+
+PathsAc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeA, values=stA, labels=LabAc , name="ac" )
+PathsCc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeC, values=stC, labels=LabCc , name="cc" )
+PathsEc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeE, values=stE, labels=LabEc , name="ec" )
+covAc		<-mxAlgebra( expression= ac %*% t(ac), name="Ac" ) #cannot parse PGS variance into ACE
+covCc		<-mxAlgebra( expression= cc %*% t(cc), name="Cc" ) #use these for standardisation.
+covEc		<-mxAlgebra( expression= ec %*% t(ec), name="Ec" )
+covPc		<-mxAlgebra( expression= Ac+Cc+Ec, name="Vc" ) #use a 2 x 2 matrix only. 
+MZcovPc		<-mxAlgebra( expression= Ac+Cc, name="MZVc" )
+DZcovPc		<-mxAlgebra( expression= 0.5%x%Ac+Cc, name="DZVc" )
+
+#then specify var for PGS with a unit matrix (freely estimated)
+PGSpath	<-mxMatrix(type="Full", nrow=1, ncol=1, free=T, values=0.5, labels="PGS_sd" , name="PGSp" )
+PGSvar<-mxAlgebra(expression=PGSp%*%t(PGSp),name="varPGS") #this will be the double headed arrow for variance of PGS
+
+#zero matrices
+zeromat<-mxMatrix(type="Zero",nrow=2,ncol=1,free=F,name="zero")
+zeromat2<-mxMatrix(type="Zero",nrow=1,ncol=2,free=F,name="zero2")
+
+totV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,Vc)),name="total_var")#if it complains, switch rbind and cbind.
+#matrix above is a 3 x 3 matrix, within-twin matrix 
+totMZV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,MZVc)),name="MZ_covar") #this is between person
+totDZV<-mxAlgebra(expression=cbind(rbind(0.5%x%varPGS,zero),rbind(zero2,DZVc)),name="DZ_covar")
+
+# Generate Covariance of Latent factor model Including Causal Paths between factors
+Id3		<-mxMatrix(type="Iden",	nrow=nfact, ncol=nfact, name="I3" )
+
+covFV	<-mxAlgebra( expression= solve(I3-PhC) %&% total_var, name ="FV")
+covMZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% MZ_covar, name ="MZFV") 
+covDZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% DZ_covar, name ="DZFV") 
+
+
+# Constraint on total variance of Ordinal variable (A+C+E=1)
+varL		<- mxConstraint( expression=FV[3,3]==1, name="L" ) #total variablity after taking into account for causal effects
+
+# Var-Cov of measured vars in terms of latent factors and AC, Cc, and Ec
+#this results in a 6x6 matrix
+
+covMZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, MZFV), cbind(MZFV, FV) )) , name="expCovMZ" )#This traces the path from vars to factors and back to vars
+covDZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, DZFV), cbind(DZFV, FV) )) , name="expCovDZ" )
+
+
+# Algebra to compute standardized variance components
+#generate a 2x2 matrix which has taken into account for causal effects from FV:
+Var2by2<-mxAlgebra(expression=FV[2:3,2:3],name="FV2by2")
+StA	<- mxAlgebra( expression=Ac/FV2by2, name="h2")
+StC	<- mxAlgebra( expression=Cc/FV2by2, name="c2")
+StE	<- mxAlgebra( expression=Ec/FV2by2, name="e2")
+
+# # Algebra to compute Phenotypic, A, C & E correlations for exposure and outcome
+matI	<- mxMatrix( type="Iden", nrow=nv-1, ncol=nv-1, name="I2")
+rph	<- mxAlgebra( expression= solve(sqrt(I3*FV)) %*% FV %*% solve(sqrt(I3*FV)), name="Rph")#get overall Rph
+rAc	<- mxAlgebra( expression= solve(sqrt(I2*Ac)) %*% Ac %*% solve(sqrt(I2*Ac)), name="Rac" )
+
+
+# Algebra to get standardised b1, b2 and g1 paths:
+beta1=mxAlgebra(expression= (PhC[2,1]*sqrt(FV[1,1]))/(sqrt(FV[2,2])), name="stB1")
+beta2=mxAlgebra(expression= (PhC[3,2]*sqrt(FV[2,2]))/(sqrt(FV[3,3])), name="stG1")
+pleio=mxAlgebra(expression= (PhC[3,1]*sqrt(FV[1,1]))/(sqrt(FV[3,3])), name="stB2")
+
+
+#algebra to get RPh due to A,C,E and causal effects: 
+RphACE<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                   #(sqrt(c2[1,1])*Rcc[2,1]*sqrt(c2[2,2])),
+                                   #(sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), #this should be zero because re will be fixed to zero.
+                                   stB2*stB1, stG1),name="ACErph")
+
+# Data objects for Multiple Groups
+dataMZ	<- mxData( observed=mzdata, type="raw" )
+dataDZ	<- mxData( observed=dzdata, type="raw" )
+
+
+# Objective objects for Multiple Groups
+objMZ		<- mxExpectationNormal( covariance="expCovMZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("SSH1","SSH2") )
+objDZ		<- mxExpectationNormal( covariance="expCovDZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("SSH1","SSH2") )
+
+fitFunction <- mxFitFunctionML()
+
+
+# Combine Groups
+
+pars<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+           covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+           StA,StC,StE,matI,rph,rAc,beta1,beta2,pleio,Var2by2,RphACE)
+
+modelMZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ" )
+modelDZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ" )
+
+
+minus2ll	<-mxAlgebra( expression=MZ.objective + DZ.objective, name="m2LL" )
+obj		<-mxFitFunctionAlgebra( "m2LL" )
+
+ACEModel	<-mxModel("ACE", pars, modelMZ, modelDZ, minus2ll, obj)
+
+#### run the ACE model which already has the parameters set or constrained: 
+ACEFit		<-mxTryHardOrdinal(ACEModel, intervals=F)
+(ACESum	<- summary(ACEFit))
+mxEval(MZ.ExpMean,ACEFit)
+
+tableMZ<-as.table(mxEval(MZ.expCovMZ,ACEFit))
+colnames(tableMZ)<-c("PGS1","pCONN1","SSH1","PGS2","pCONN2","SSH2")
+rownames(tableMZ)<-c("PGS1","pCONN1","SSH1","PGS2","pCONN2","SSH2")
+round(tableMZ,3)
+
+tableDZ<-as.table(mxEval(DZ.expCovDZ,ACEFit))
+colnames(tableDZ)<-c("PGS1","pCONN1","SSH1","PGS2","pCONN2","SSH2")
+rownames(tableDZ)<-c("PGS1","pCONN1","SSH1","PGS2","pCONN2","SSH2")
+round(tableDZ,3)
+
+mxEval(MZ.stB1,ACEFit)
+
+pathsCI1	<-mxCI (c ('MZ.stB1','MZ.stG1','MZ.stB2'))
+pathsCI2<-mxCI(c('MZ.h2[1,1]','MZ.c2[1,1]','MZ.e2[1,1]',
+                 'MZ.h2[2,2]','MZ.e2[2,2]'))
+pathsCI3<-mxCI(c('MZ.Rac[2,1]','MZ.Rph[3,2]',
+                 'MZ.ACErph[1,1]','MZ.ACErph[1,2]','MZ.ACErph[1,3]'))
+
+#CI1
+ACEModel1<-mxModel(ACEFit,pathsCI1)
+ACEFit1<-mxRun(ACEModel1,intervals=T)
+(ACESum1	<- summary(ACEFit1))
+
+#CI2
+ACEModel2<-mxModel(ACEFit,pathsCI2)
+ACEFit2<-mxRun(ACEModel2,intervals=T)
+(ACESum2	<- summary(ACEFit2))
+
+#CI3
+ACEModel3<-mxModel(ACEFit,pathsCI3)
+ACEFit3<-mxRun(ACEModel3,intervals=T)
+(ACESum3	<- summary(ACEFit3))
+
+
+sum(mxEval(MZ.ACErph[1:3],ACEFit))
+
+ACESum1$CI
+ACESum2$CI
+ACESum3$CI
+
+
+##### create full bivariate model without direction of causation for comparison #####
+## re = True, stb2= False
+FullBiMod<-mxModel(ACEFit,name="Full_Bi")
+FullBiMod<-omxSetParameters(FullBiMod, labels=c("Exy","X_to_Y"), free=c(T,F),values=c(0.5,0))
+FullBiFit<-mxRun(FullBiMod, intervals=F)
+(FullBiSum<-summary(FullBiFit,verbose=T))
+#check re
+Ec<-mxEval(MZ.Ec,FullBiFit)
+Itwo<-mxEval(MZ.I2,FullBiFit)
+(Rec<-solve(sqrt(Itwo*Ec)) %*% Ec %*% solve(sqrt(Itwo*Ec)))
+
+#check G1 (the causal effect)
+mxEval(MZ.stG1,FullBiFit)
+
+#other values
+mxEval(MZ.stB1,FullBiFit)
+mxEval(MZ.stB2,FullBiFit)
+mxEval(MZ.h2,FullBiFit);mxEval(MZ.c2,FullBiFit);mxEval(MZ.e2,FullBiFit)
+mxEval(MZ.Rac,FullBiFit)
+mxEval(MZ.Rph,FullBiFit)
+
+#get Rcc
+Cc<-mxEval(MZ.Cc,FullBiFit)
+(Rcc<-solve(sqrt(Itwo*Cc)) %*% Cc %*% solve(sqrt(Itwo*Cc)))
+# compare the two models
+mxCompare(FullBiFit,ACEFit)
+
+## now run model without effect of PRS only but still with stb2 and rc,re dropped ###
+DoC_Mod<-mxModel(ACEFit,name="DOC")
+DoC_Mod<-omxSetParameters(DoC_Mod, labels=c("PGS_to_X","PGS_to_Y"), free=c(F,F),values=c(0,0))
+DoC_Fit<-mxRun(DoC_Mod, intervals=F)
+(DoCSum<-summary(DoC_Fit,verbose=T))
+
+#check PGS effect
+mxEval(MZ.stB1,DoC_Fit);mxEval(MZ.stB2,DoC_Fit)
+#values for the path diagram
+mxEval(MZ.stG1,DoC_Fit)
+mxEval(MZ.h2,DoC_Fit);mxEval(MZ.c2,DoC_Fit);mxEval(MZ.e2,DoC_Fit)
+mxEval(MZ.Rac,DoC_Fit)
+mxEval(MZ.Rph,DoC_Fit)
+mxEval(MZ.expCovMZ,DoC_Fit);mxEval(DZ.expCovDZ,DoC_Fit)
+#compare the models
+mxCompare(ACEFit,DoC_Fit)
+
+##### sensitivity analysis: what if rE is not zero, e.g. fixed to 0.20? #####
+#add re into the model
+##### sensitivity analysis: what if rE is not zero, e.g. fixed to 0.20? #####
+#add re into the model
+rEc	<- mxAlgebra( expression= solve(sqrt(I2*Ec)) %*% Ec %*% solve(sqrt(I2*Ec)), name="Rec" )
+RphACE2<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                    #(sqrt(c2[1,1])*Rcc[2,1]*sqrt(c2[2,2])),
+                                    (sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), 
+                                    stB2*stB1, stb2),name="ACErph2")
+pars2<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+            covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+            StA,StC,StE,matI,rph,rAc,rEc,beta1,beta2,pleio,Var2by2,RphACE2)
+
+modelMZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ2" )
+modelDZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ2" )
+minus2ll2	<-mxAlgebra( expression=MZ2.objective + DZ2.objective, name="m2LL2" )
+obj2		<-mxFitFunctionAlgebra( "m2LL2" )
+rE_fixed_Model	<-mxModel("rE_fixed", pars2, modelMZ2, modelDZ2, minus2ll2, obj2)
+rE_fixed_Model <-omxSetParameters(rE_fixed_Model, labels=c("Exy", "X_to_Y"), free=c(T,T),values=c(0.5,0.2))
+
+pathsCI_rEfix	<-mxCI (c ('MZ2.stb2'))
+#re = 0.05
+rE_fixed_Model005<-mxModel(rE_fixed_Model,name="rE_fixed",
+                           mxConstraint(MZ2.Rec[1,2]==0.05, name="con1"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit1		<- mxTryHardOrdinal(rE_fixed_Model005, intervals = T)
+
+(rE_Fixed_FitSumm1<-summary(rE_Fixed_Fit1,verbose=T))
+mxEval(MZ2.stG1,rE_Fixed_Fit1)
+mxEval(MZ2.Rec,rE_Fixed_Fit1)
+
+## re=0.10
+rE_fixed_Model010<-mxModel(rE_fixed_Model,name="rE_fixed2",
+                           mxConstraint(MZ2.Rec[1,2]==0.10, name="con2"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit2		<- mxTryHardOrdinal(rE_fixed_Model010, intervals = T)
+
+(rE_Fixed_FitSumm2<-summary(rE_Fixed_Fit2,verbose=T))
+
+## re=0.15
+rE_fixed_Model015<-mxModel(rE_fixed_Model,name="rE_fixed3",
+                           mxConstraint(MZ2.Rec[1,2]==0.15, name="con3"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit3		<- mxTryHardOrdinal(rE_fixed_Model015, intervals = T)
+
+(rE_Fixed_FitSumm3<-summary(rE_Fixed_Fit3,verbose=T))
+
+## re=0.20
+rE_fixed_Model020<-mxModel(rE_fixed_Model,name="rE_fixed4",
+                           mxConstraint(MZ2.Rec[1,2]==0.20, name="con4"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit4		<- mxTryHardOrdinal(rE_fixed_Model020, intervals = T)
+
+(rE_Fixed_FitSumm4<-summary(rE_Fixed_Fit4,verbose=T))
+
+## re=0.25
+rE_fixed_Model025<-mxModel(rE_fixed_Model,name="rE_fixed5",
+                           mxConstraint(MZ2.Rec[1,2]==0.25, name="con5"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit5		<- mxTryHardOrdinal(rE_fixed_Model025, intervals = T)
+
+(rE_Fixed_FitSumm5<-summary(rE_Fixed_Fit5,verbose=T))
+
+
+rbind(mxCompare(ACEFit1,rE_Fixed_Fit1),
+      mxCompare(ACEFit1,rE_Fixed_Fit2)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit3)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit4)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit5)[2,])
+
+rbind(mxEval(MZ2.stG1,rE_Fixed_Fit1),
+      mxEval(MZ2.stG1,rE_Fixed_Fit2),
+      mxEval(MZ2.stG1,rE_Fixed_Fit3),
+      mxEval(MZ2.stG1,rE_Fixed_Fit4),
+      mxEval(MZ2.stG1,rE_Fixed_Fit5))
+
+
+rbind(ACESum1$CI[2,],
+      rE_Fixed_FitSumm1$CI,
+      rE_Fixed_FitSumm2$CI,
+      rE_Fixed_FitSumm3$CI,
+      rE_Fixed_FitSumm4$CI,
+      rE_Fixed_FitSumm5$CI)
+## save the results as RData
+save.image("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv5_pCONN_SSH_20_April_2021.RData")
+load("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv5_pCONN_SSH_20_April_2021.RData")
+
+```
+
+### pMFQ-NSSH
+```{r pMFQ-NSSH, eval=FALSE}
+#******************************************************
+#residualise first, then tranform
+merged_data$res_basic_pMFQ1<- residuals(lm(merged_data$ppbhmfqt1
+                                           ~merged_data$age_161 + merged_data$sex1,
+                                           na.action="na.exclude"))
+merged_data$res_trans_order_pMFQ1 <-log(merged_data$res_basic_pMFQ1+1.5)*3
+
+#do same thing for twin 2. 
+merged_data$res_basic_pMFQ2<- residuals(lm(merged_data$ppbhmfqt2
+                                           ~merged_data$age_162 + merged_data$sex2,
+                                           na.action="na.exclude"))
+
+merged_data$res_trans_order_pMFQ2 <-log(merged_data$res_basic_pMFQ2+1.5)*3
+
+#***************************************************************************************
+#################################### MR-DoC model ######################################
+#***************************************************************************************
+
+#variables I will need for this pMFQ MR-DoC model:
+vars		<-c('MDD_PRS','pMFQ','SH')
+selVars	<-c('MDD100_res_t1', 'res_trans_order_pMFQ1','NSSH1',
+            'MDD100_res_t2', 'res_trans_order_pMFQ2','NSSH2')
+
+useVars	<-c('MDD100_res_t1', 'res_trans_order_pMFQ1','NSSH1',
+            'MDD100_res_t2', 'res_trans_order_pMFQ2','NSSH2',
+            'age1', 'age2', 'sex1','sex2') #age is for at age 21
+
+
+#need to recode missing age into 999
+table(is.na(merged_data$age1))
+merged_data$NSSH1[is.na(merged_data$age1)] <- NA
+merged_data$NSSH2[is.na(merged_data$age2)] <- NA
+merged_data$age1[is.na(merged_data$age1)] <- 999
+merged_data$age2[is.na(merged_data$age2)] <- 999
+merged_data[1:20,1:8]
+
+#mz and dzdata for using res_trans_order_cMFQ
+mzdata<-subset(merged_data, zygos%in%1&random==1 , useVars)
+dzdata<-subset(merged_data, zygos%in%2&random==1 , useVars)
+
+
+head(mzdata)
+
+#do ACE model #
+nv			<- 3				# number of variables for a twin = 1 in Univariate
+nvo 			<- 1     			#number of ordinal variables per twin
+nvc 			<- nv-nvo  			#number of continuous variables per twin
+poso 			<- nvo 			#position where ordinal variables start
+ntv			<- 2*nv			# number of variables for a pair = 2* 1 for Univariate
+nth			<- 4	# number of max thresholds
+nfact		<- 3				# number of Latent Factors 
+ncor			<- (nv*(nv+1)/2)-nv	# number of free elements in a correlation matrix nv*nv
+ninc 			<- nth-1 			#number of max increments
+ncovariates 	<- 2 				#number of covariates
+
+
+# Define definition variables to hold the Covariates
+
+obsAge1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age1"), name="Age1")
+obsAge2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age2"), name="Age2")
+obsSex1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex1"), name="Sex1")
+obsSex2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex2"), name="Sex2")
+
+#effect of age and sex on ordinal variable
+LabCovA	<-c('BageThNSSH', 'BageThNSSH','BageThNSSH', 'BageThNSSH')
+LabCovS <-c('BsexThNSSH', 'BsexThNSSH','BsexThNSSH', 'BsexThNSSH')
+
+betaA		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovA, name="BageTH" )
+betaS		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovS, name="BsexTH" )
+
+#mean matrix, set NSSH to NA and fixed
+StMZmean=c(colMeans(mzdata[,1:2],na.rm=TRUE),0)
+Mean	<-mxMatrix( "Full", 1, ntv, free=c(T,T,F,T,T,F), values=StMZmean, labels=c("mPGS", 'mpMFQ',NA, "mPGS", 'mpMFQ',NA), name="ExpMean" )
+
+
+#Threshold matrix
+StTH		<-c(-1,0.1,0.1,0.1)
+LabTh	<-c('Tmz_11','imz_11','imz_12','imz_13')
+Tr		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=StTH, lbound=c(-4,0.001,0.001,0.001), ubound=c(4,4),
+                labels=LabTh, name="Th")
+
+inc		<-mxMatrix( type="Lower",nrow=nth, ncol=nth, free=F, values=1, name="Low")
+
+Thres	<-mxAlgebra( expression= cbind(Low%*%Th + BageTH%x%Age1 + BsexTH%x%Sex1,
+                                     Low%*%Th + BageTH%x%Age2 + BsexTH%x%Sex2),
+                   name="ExpThres")
+
+#Matrix that holds loadings from observed to latent variables
+PatFl	<- c(F,F,F,
+           F,F,F,
+           F,F,F) # Fix observed to latent to be 1 for all variables
+StFl		<- c(1,0,0,
+           0,1,0,
+           0,0,1)
+LabFl	<- c('PGS',NA,NA,
+           NA,'X',NA,
+           NA, NA,'Y')
+Load		<-mxMatrix(type="Full",	nrow=nv, ncol=nfact, free=PatFl, values=StFl, labels=LabFl, name="Loadings" )
+Id2		<-mxMatrix(type="Iden",	nrow=2, ncol=2, free=F, name="I2" ) 
+LoadTw	<-mxAlgebra(I2%x%Loadings, name="FactLTw") #this will be a 2*nv x 2*nfact matrix,making it possible for both twins
+
+#beta matrix to hold causal relationships
+# Define the matrix to hold the Single headed Arrows (causal paths) between the 3 latent variables
+# NB: direction of causation goes DOWN the column & OUT along the row
+PatPhC<-c(F,T,T,
+          F,F,T,
+          F,F,F)
+StPhC<-c(0,0.05,0.05,
+         0,0,0.05,
+         0,0,0)
+LabPhC<-c(NA,"PGS_to_X","PGS_to_Y",
+          NA,NA,"X_to_Y",
+          NA,NA,NA)
+PhCaus	<-mxMatrix(type="Full",	nrow=nfact, ncol=nfact, free=PatPhC, values=StPhC, labels=LabPhC, name="PhC" )
+
+### Build the ACE components
+# Define the matrices to hold the A and C effects: Common (upper) 
+LabAc<-c("Ax","Axy","Ay")
+freeA<-c(T,T,T)
+stA<-c(0.5,0.5,0.5)
+
+LabCc<-c("Cx","Cxy","Cy")
+freeC<-c(T,F,F)
+stC<-c(0.5,0,0)
+
+LabEc<-c("Ex","Exy","Ey")
+freeE<-c(T,F,T)
+stE<-c(0.5,0,0.5)
+
+
+
+PathsAc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeA, values=stA, labels=LabAc , name="ac" )
+PathsCc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeC, values=stC, labels=LabCc , name="cc" )
+PathsEc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeE, values=stE, labels=LabEc , name="ec" )
+covAc		<-mxAlgebra( expression= ac %*% t(ac), name="Ac" ) #cannot parse PGS variance into ACE
+covCc		<-mxAlgebra( expression= cc %*% t(cc), name="Cc" ) #use these for standardisation.
+covEc		<-mxAlgebra( expression= ec %*% t(ec), name="Ec" )
+covPc		<-mxAlgebra( expression= Ac+Cc+Ec, name="Vc" ) #use a 2 x 2 matrix only. 
+MZcovPc		<-mxAlgebra( expression= Ac+Cc, name="MZVc" )
+DZcovPc		<-mxAlgebra( expression= 0.5%x%Ac+Cc, name="DZVc" )
+
+#then specify var for PGS with a unit matrix (freely estimated)
+PGSpath	<-mxMatrix(type="Full", nrow=1, ncol=1, free=T, values=0.5, labels="PGS_sd" , name="PGSp" )
+PGSvar<-mxAlgebra(expression=PGSp%*%t(PGSp),name="varPGS") #this will be the double headed arrow for variance of PGS
+
+#zero matrices
+zeromat<-mxMatrix(type="Zero",nrow=2,ncol=1,free=F,name="zero")
+zeromat2<-mxMatrix(type="Zero",nrow=1,ncol=2,free=F,name="zero2")
+
+totV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,Vc)),name="total_var")#if it complains, switch rbind and cbind.
+#matrix above is a 3 x 3 matrix, within-twin matrix 
+totMZV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,MZVc)),name="MZ_covar") #this is between person
+totDZV<-mxAlgebra(expression=cbind(rbind(0.5%x%varPGS,zero),rbind(zero2,DZVc)),name="DZ_covar")
+
+# Generate Covariance of Latent factor model Including Causal Paths between factors
+Id3		<-mxMatrix(type="Iden",	nrow=nfact, ncol=nfact, name="I3" )
+
+covFV	<-mxAlgebra( expression= solve(I3-PhC) %&% total_var, name ="FV")
+covMZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% MZ_covar, name ="MZFV") 
+covDZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% DZ_covar, name ="DZFV") 
+
+# Constraint on total variance of Ordinal variable (A+C+E=1)
+varL		<- mxConstraint( expression=FV[3,3]==1, name="L" ) #total variablity after taking into account for causal effects
+
+# Var-Cov of measured vars in terms of latent factors and AC, Cc, and Ec
+#this results in a 6x6 matrix
+
+covMZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, MZFV), cbind(MZFV, FV) )) , name="expCovMZ" )#This traces the path from vars to factors and back to vars
+covDZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, DZFV), cbind(DZFV, FV) )) , name="expCovDZ" )
+
+
+# Algebra to compute standardized variance components
+#generate a 2x2 matrix which has taken into account for causal effects from FV:
+Var2by2<-mxAlgebra(expression=FV[2:3,2:3],name="FV2by2")
+StA	<- mxAlgebra( expression=Ac/FV2by2, name="h2")
+StC	<- mxAlgebra( expression=Cc/FV2by2, name="c2")
+StE	<- mxAlgebra( expression=Ec/FV2by2, name="e2")
+
+# # Algebra to compute Phenotypic, A, C & E correlations for exposure and outcome
+matI	<- mxMatrix( type="Iden", nrow=nv-1, ncol=nv-1, name="I2")
+rph	<- mxAlgebra( expression= solve(sqrt(I3*FV)) %*% FV %*% solve(sqrt(I3*FV)), name="Rph")#get overall Rph
+rAc	<- mxAlgebra( expression= solve(sqrt(I2*Ac)) %*% Ac %*% solve(sqrt(I2*Ac)), name="Rac" )
+
+
+# Algebra to get standardised b1, b2 and g1 paths:
+beta1=mxAlgebra(expression= (PhC[2,1]*sqrt(FV[1,1]))/(sqrt(FV[2,2])), name="stB1")
+beta2=mxAlgebra(expression= (PhC[3,2]*sqrt(FV[2,2]))/(sqrt(FV[3,3])), name="stG1")
+pleio=mxAlgebra(expression= (PhC[3,1]*sqrt(FV[1,1]))/(sqrt(FV[3,3])), name="stB2")
+
+
+#algebra to get RPh due to A,C,E and causal effects: 
+RphACE<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                   #(sqrt(c2[1,1])*Rcc[2,1]*sqrt(c2[2,2])),
+                                   #(sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), #this should be zero because re will be fixed to zero.
+                                   stB2*stB1, stG1),name="ACErph")
+
+# Data objects for Multiple Groups
+dataMZ	<- mxData( observed=mzdata, type="raw" )
+dataDZ	<- mxData( observed=dzdata, type="raw" )
+
+
+# Objective objects for Multiple Groups
+objMZ		<- mxExpectationNormal( covariance="expCovMZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("NSSH1","NSSH2") )
+objDZ		<- mxExpectationNormal( covariance="expCovDZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("NSSH1","NSSH2") )
+
+fitFunction <- mxFitFunctionML()
+
+# Combine Groups
+
+pars<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+           covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+           StA,StC,StE,matI,rph,rAc,beta1,beta2,pleio,Var2by2,RphACE)
+
+modelMZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ" )
+modelDZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ" )
+
+
+minus2ll	<-mxAlgebra( expression=MZ.objective + DZ.objective, name="m2LL" )
+obj		<-mxFitFunctionAlgebra( "m2LL" )
+
+ACEModel	<-mxModel("ACE", pars, modelMZ, modelDZ, minus2ll, obj)
+
+#### run the ACE model which already has the parameters set or constrained: 
+ACEFit		<-mxTryHardOrdinal(ACEModel, intervals=F)
+(ACESum	<- summary(ACEFit))
+mxEval(MZ.ExpMean,ACEFit)
+
+tableMZ<-as.table(mxEval(MZ.expCovMZ,ACEFit))
+colnames(tableMZ)<-c("PGS1","pMFQ1","NSSH1","PGS2","pMFQ2","NSSH2")
+rownames(tableMZ)<-c("PGS1","pMFQ1","NSSH1","PGS2","pMFQ2","NSSH2")
+round(tableMZ,3)
+
+tableDZ<-as.table(mxEval(DZ.expCovDZ,ACEFit))
+colnames(tableDZ)<-c("PGS1","pMFQ1","NSSH1","PGS2","pMFQ2","NSSH2")
+rownames(tableDZ)<-c("PGS1","pMFQ1","NSSH1","PGS2","pMFQ2","NSSH2")
+round(tableDZ,3)
+
+mxEval(MZ.stB1,ACEFit)
+
+pathsCI1	<-mxCI (c ('MZ.stB1','MZ.stG1','MZ.stB2'))
+pathsCI2<-mxCI(c('MZ.h2[1,1]','MZ.c2[1,1]','MZ.e2[1,1]',
+                 'MZ.h2[2,2]','MZ.e2[2,2]'))
+pathsCI3<-mxCI(c('MZ.Rac[2,1]','MZ.Rph[3,2]',
+                 'MZ.ACErph[1,1]','MZ.ACErph[1,2]','MZ.ACErph[1,3]'))
+
+#CI1
+ACEModel1<-mxModel(ACEFit,pathsCI1)
+ACEFit1<-mxRun(ACEModel1,intervals=T)
+(ACESum1	<- summary(ACEFit1))
+
+#CI2
+ACEModel2<-mxModel(ACEFit,pathsCI2)
+ACEFit2<-mxRun(ACEModel2,intervals=T)
+(ACESum2	<- summary(ACEFit2))
+
+#CI3
+ACEModel3<-mxModel(ACEFit,pathsCI3)
+ACEFit3<-mxRun(ACEModel3,intervals=T)
+(ACESum3	<- summary(ACEFit3))
+
+
+sum(mxEval(MZ.ACErph[1:3],ACEFit))
+
+ACESum1$CI
+ACESum2$CI
+ACESum3$CI
+
+
+##### create full bivariate model without direction of causation for comparison #####
+## re = True, stG1= False
+FullBiMod<-mxModel(ACEFit,name="Full_Bi")
+FullBiMod<-omxSetParameters(FullBiMod, labels=c("Exy","X_to_Y"), free=c(T,F),values=c(0.5,0))
+FullBiFit<-mxRun(FullBiMod, intervals=F)
+(FullBiSum<-summary(FullBiFit,verbose=T))
+#check re
+Ec<-mxEval(MZ.Ec,FullBiFit)
+Itwo<-mxEval(MZ.I2,FullBiFit)
+(Rec<-solve(sqrt(Itwo*Ec)) %*% Ec %*% solve(sqrt(Itwo*Ec)))
+
+#check G1 (the causal effect)
+mxEval(MZ.stG1,FullBiFit)
+
+#other values
+mxEval(MZ.stB1,FullBiFit)
+mxEval(MZ.stB2,FullBiFit)
+mxEval(MZ.h2,FullBiFit);mxEval(MZ.c2,FullBiFit);mxEval(MZ.e2,FullBiFit)
+mxEval(MZ.Rac,FullBiFit)
+mxEval(MZ.Rph,FullBiFit)
+
+#get Rcc
+Cc<-mxEval(MZ.Cc,FullBiFit)
+(Rcc<-solve(sqrt(Itwo*Cc)) %*% Cc %*% solve(sqrt(Itwo*Cc)))
+# compare the two models
+mxCompare(FullBiFit,ACEFit)
+
+## now run model without effect of PRS only but still with stb2 and rc,re dropped ###
+DoC_Mod<-mxModel(ACEFit,name="DOC")
+DoC_Mod<-omxSetParameters(DoC_Mod, labels=c("PGS_to_X","PGS_to_Y"), free=c(F,F),values=c(0,0))
+DoC_Fit<-mxRun(DoC_Mod, intervals=F)
+(DoCSum<-summary(DoC_Fit,verbose=T))
+
+#check PGS effect
+mxEval(MZ.stB1,DoC_Fit);mxEval(MZ.stB2,DoC_Fit)
+#values for the path diagram
+mxEval(MZ.stG1,DoC_Fit)
+mxEval(MZ.h2,DoC_Fit);mxEval(MZ.c2,DoC_Fit);mxEval(MZ.e2,DoC_Fit)
+mxEval(MZ.Rac,DoC_Fit)
+mxEval(MZ.Rph,DoC_Fit)
+mxEval(MZ.expCovMZ,DoC_Fit);mxEval(DZ.expCovDZ,DoC_Fit)
+#compare the models
+mxCompare(ACEFit,DoC_Fit)
+
+##### sensitivity analysis: what if rE is not zero, e.g. fixed to 0.20? #####
+#add re into the model
+rEc	<- mxAlgebra( expression= solve(sqrt(I2*Ec)) %*% Ec %*% solve(sqrt(I2*Ec)), name="Rec" )
+RphACE2<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                    #(sqrt(c2[1,1])*Rcc[2,1]*sqrt(c2[2,2])),
+                                    (sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), 
+                                    stB2*stB1, stG1),name="ACErph2")
+pars2<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+            covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+            StA,StC,StE,matI,rph,rAc,rEc,beta1,beta2,pleio,Var2by2,RphACE2)
+
+modelMZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ2" )
+modelDZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ2" )
+minus2ll2	<-mxAlgebra( expression=MZ2.objective + DZ2.objective, name="m2LL2" )
+obj2		<-mxFitFunctionAlgebra( "m2LL2" )
+rE_fixed_Model	<-mxModel("rE_fixed", pars2, modelMZ2, modelDZ2, minus2ll2, obj2)
+rE_fixed_Model <-omxSetParameters(rE_fixed_Model, labels=c("Exy", "X_to_Y"), free=c(T,T),values=c(0.5,0.2))
+
+pathsCI_rEfix	<-mxCI (c ('MZ2.stG1'))
+#re = 0.05
+rE_fixed_Model005<-mxModel(rE_fixed_Model,name="rE_fixed",
+                           mxConstraint(MZ2.Rec[1,2]==0.05, name="con1"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit1		<- mxTryHardOrdinal(rE_fixed_Model005, intervals = T)
+
+(rE_Fixed_FitSumm1<-summary(rE_Fixed_Fit1,verbose=T))
+mxEval(MZ2.stG1,rE_Fixed_Fit1)
+mxEval(MZ2.Rec,rE_Fixed_Fit1)
+
+## re=0.10
+rE_fixed_Model010<-mxModel(rE_fixed_Model,name="rE_fixed2",
+                           mxConstraint(MZ2.Rec[1,2]==0.10, name="con2"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit2		<- mxTryHardOrdinal(rE_fixed_Model010, intervals = T,extraTries=20)
+
+(rE_Fixed_FitSumm2<-summary(rE_Fixed_Fit2,verbose=T))
+
+## re=0.15
+rE_fixed_Model015<-mxModel(rE_fixed_Model,name="rE_fixed3",
+                           mxConstraint(MZ2.Rec[1,2]==0.15, name="con3"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit3		<- mxTryHardOrdinal(rE_fixed_Model015, intervals = T, extraTries=20)
+
+(rE_Fixed_FitSumm3<-summary(rE_Fixed_Fit3,verbose=T))
+
+## re=0.20
+rE_fixed_Model020<-mxModel(rE_fixed_Model,name="rE_fixed4",
+                           mxConstraint(MZ2.Rec[1,2]==0.20, name="con4"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit4		<- mxTryHardOrdinal(rE_fixed_Model020, intervals = T,extraTries=20)
+
+(rE_Fixed_FitSumm4<-summary(rE_Fixed_Fit4,verbose=T))
+
+## re=0.25
+rE_fixed_Model025<-mxModel(rE_fixed_Model,name="rE_fixed5",
+                           mxConstraint(MZ2.Rec[1,2]==0.25, name="con5"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit5		<- mxTryHardOrdinal(rE_fixed_Model025, intervals = T)
+
+(rE_Fixed_FitSumm5<-summary(rE_Fixed_Fit5,verbose=T))
+
+
+rbind(mxCompare(ACEFit1,rE_Fixed_Fit1),
+      mxCompare(ACEFit1,rE_Fixed_Fit2)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit3)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit4)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit5)[2,])
+
+rbind(mxEval(MZ2.stG1,rE_Fixed_Fit1),
+      mxEval(MZ2.stG1,rE_Fixed_Fit2),
+      mxEval(MZ2.stG1,rE_Fixed_Fit3),
+      mxEval(MZ2.stG1,rE_Fixed_Fit4),
+      mxEval(MZ2.stG1,rE_Fixed_Fit5))
+
+
+rbind(ACESum1$CI[2,],
+      rE_Fixed_FitSumm1$CI,
+      rE_Fixed_FitSumm2$CI,
+      rE_Fixed_FitSumm3$CI,
+      rE_Fixed_FitSumm4$CI,
+      rE_Fixed_FitSumm5$CI)
+## save the results as RData
+save.image("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv5_pMFQ_NSSH_20_April_2021.RData")
+load("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv3_pMFQ_NSSH_08_April_2021.RData")
+
+```
+
+### pMFQ-SSH
+```{r pMFQ-SSH, eval=FALSE}
+#**Regressing  out age & sex **#
+
+#residualise first, then tranform
+merged_data$res_basic_pMFQ1<- residuals(lm(merged_data$ppbhmfqt1
+                                           ~merged_data$age_161 + merged_data$sex1,
+                                           na.action="na.exclude"))
+merged_data$res_trans_order_pMFQ1 <-log(merged_data$res_basic_pMFQ1+1.5)*3
+
+#do same thing for twin 2. 
+merged_data$res_basic_pMFQ2<- residuals(lm(merged_data$ppbhmfqt2
+                                           ~merged_data$age_162 + merged_data$sex2,
+                                           na.action="na.exclude"))
+
+merged_data$res_trans_order_pMFQ2 <-log(merged_data$res_basic_pMFQ2+1.5)*3
+
+#***************************************************************************************
+#################################### MR-DoC model ######################################
+#***************************************************************************************
+
+#variables I will need for this pMFQ MR-DoC model:
+vars		<-c('MDD_PRS','pMFQ','SH')
+selVars	<-c('MDD100_res_t1', 'res_trans_order_pMFQ1','SSH1',
+            'MDD100_res_t2', 'res_trans_order_pMFQ2','SSH2')
+
+useVars	<-c('MDD100_res_t1', 'res_trans_order_pMFQ1','SSH1',
+            'MDD100_res_t2', 'res_trans_order_pMFQ2','SSH2',
+            'age1', 'age2', 'sex1','sex2') #age is for at age 21
+
+
+#need to recode missing age into 999
+table(is.na(merged_data$age1))
+merged_data$SSH1[is.na(merged_data$age1)] <- NA
+merged_data$SSH2[is.na(merged_data$age2)] <- NA
+merged_data$age1[is.na(merged_data$age1)] <- 999
+merged_data$age2[is.na(merged_data$age2)] <- 999
+merged_data[1:20,1:8]
+
+#mz and dzdata for using res_trans_order_cMFQ
+mzdata<-subset(merged_data, zygos%in%1&random==1 , useVars)
+dzdata<-subset(merged_data, zygos%in%2&random==1 , useVars)
+
+
+
+head(mzdata)
+
+#do ACE model #
+nv			<- 3				# number of variables for a twin = 1 in Univariate
+nvo 			<- 1     			#number of ordinal variables per twin
+nvc 			<- nv-nvo  			#number of continuous variables per twin
+poso 			<- nvo 			#position where ordinal variables start
+ntv			<- 2*nv			# number of variables for a pair = 2* 1 for Univariate
+nth			<- 4	# number of max thresholds
+nfact		<- 3				# number of Latent Factors
+ncor			<- (nv*(nv+1)/2)-nv	# number of free elements in a correlation matrix nv*nv
+ninc 			<- nth-1 			#number of max increments
+ncovariates 	<- 2 				#number of covariates
+
+
+# Define definition variables to hold the Covariates
+
+obsAge1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age1"), name="Age1")
+obsAge2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.age2"), name="Age2")
+obsSex1	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex1"), name="Sex1")
+obsSex2	<- mxMatrix( type="Full", nrow=1, ncol=1, free=F, labels=c("data.sex2"), name="Sex2")
+
+#effect of age and sex on ordinal variable
+LabCovA	<-c('BageThSSH', 'BageThSSH','BageThSSH', 'BageThSSH')
+LabCovS <-c('BsexThSSH', 'BsexThSSH','BsexThSSH', 'BsexThSSH')
+
+betaA		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovA, name="BageTH" )
+betaS		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=.2, labels=LabCovS, name="BsexTH" )
+
+#mean matrix, set NSSH to NA and fixed
+StMZmean=c(colMeans(mzdata[,1:2],na.rm=TRUE),0)
+Mean	<-mxMatrix( "Full", 1, ntv, free=c(T,T,F,T,T,F), values=StMZmean, labels=c("mPGS", 'mpMFQ',NA, "mPGS", 'mpMFQ',NA), name="ExpMean" )
+
+
+#Threshold matrix
+StTH		<-c(-1,0.1,0.1,0.1)
+LabTh	<-c('Tmz_11','imz_11','imz_12','imz_13')
+Tr		<-mxMatrix( type="Full", nrow=nth, ncol=nvo, free=T, values=StTH, lbound=c(-4,0.001,0.001,0.001), ubound=c(4,4),
+                labels=LabTh, name="Th")
+
+inc		<-mxMatrix( type="Lower",nrow=nth, ncol=nth, free=F, values=1, name="Low")
+
+Thres	<-mxAlgebra( expression= cbind(Low%*%Th + BageTH%x%Age1 + BsexTH%x%Sex1,
+                                     Low%*%Th + BageTH%x%Age2 + BsexTH%x%Sex2),
+                   name="ExpThres")
+
+#Matrix that holds loadings from observed to latent variables
+PatFl	<- c(F,F,F,
+           F,F,F,
+           F,F,F) # Fix observed to latent to be 1 for all variables
+StFl		<- c(1,0,0,
+           0,1,0,
+           0,0,1)
+LabFl	<- c('PGS',NA,NA,
+           NA,'X',NA,
+           NA, NA,'Y')
+Load		<-mxMatrix(type="Full",	nrow=nv, ncol=nfact, free=PatFl, values=StFl, labels=LabFl, name="Loadings" )
+Id2		<-mxMatrix(type="Iden",	nrow=2, ncol=2, free=F, name="I2" ) 
+LoadTw	<-mxAlgebra(I2%x%Loadings, name="FactLTw") #this will be a 2*nv x 2*nfact matrix,making it possible for both twins
+
+#beta matrix to hold causal relationships
+# Define the matrix to hold the Single headed Arrows (causal paths) between the 3 latent variables
+# NB: direction of causation goes DOWN the column & OUT along the row
+PatPhC<-c(F,T,T,
+          F,F,T,
+          F,F,F)
+StPhC<-c(0,0.05,0.05,
+         0,0,0.05,
+         0,0,0)
+LabPhC<-c(NA,"PGS_to_X","PGS_to_Y",
+          NA,NA,"X_to_Y",
+          NA,NA,NA)
+PhCaus	<-mxMatrix(type="Full",	nrow=nfact, ncol=nfact, free=PatPhC, values=StPhC, labels=LabPhC, name="PhC" )
+
+### Build the ACE components
+# Define the matrices to hold the A and C effects: Common (upper) 
+LabAc<-c("Ax","Axy","Ay")
+freeA<-c(T,T,T)
+stA<-c(0.5,0.5,0.5)
+
+LabCc<-c("Cx","Cxy","Cy")
+freeC<-c(T,F,F)
+stC<-c(0.5,0,0)
+
+LabEc<-c("Ex","Exy","Ey")
+freeE<-c(T,F,T)
+stE<-c(0.5,0,0.5)
+
+
+
+PathsAc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeA, values=stA, labels=LabAc , name="ac" )
+PathsCc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeC, values=stC, labels=LabCc , name="cc" )
+PathsEc	<-mxMatrix(type="Lower", nrow=nfact-1, ncol=nfact-1, free=freeE, values=stE, labels=LabEc , name="ec" )
+covAc		<-mxAlgebra( expression= ac %*% t(ac), name="Ac" ) #cannot parse PGS variance into ACE
+covCc		<-mxAlgebra( expression= cc %*% t(cc), name="Cc" ) #use these for standardisation.
+covEc		<-mxAlgebra( expression= ec %*% t(ec), name="Ec" )
+covPc		<-mxAlgebra( expression= Ac+Cc+Ec, name="Vc" ) #use a 2 x 2 matrix only. 
+
+
+MZcovPc		<-mxAlgebra( expression= Ac+Cc, name="MZVc" )
+DZcovPc		<-mxAlgebra( expression= 0.5%x%Ac+Cc, name="DZVc" )
+
+#then specify var for PGS with a unit matrix (freely estimated)
+PGSpath	<-mxMatrix(type="Full", nrow=1, ncol=1, free=T, values=0.5, labels="PGS_sd" , name="PGSp" )
+PGSvar<-mxAlgebra(expression=PGSp%*%t(PGSp),name="varPGS") #this will be the double headed arrow for variance of PGS
+
+#zero matrices
+zeromat<-mxMatrix(type="Zero",nrow=2,ncol=1,free=F,name="zero")
+zeromat2<-mxMatrix(type="Zero",nrow=1,ncol=2,free=F,name="zero2")
+
+totV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,Vc)),name="total_var")#if it complains, switch rbind and cbind.
+#matrix above is a 3 x 3 matrix, within-twin matrix 
+totMZV<-mxAlgebra(expression=cbind(rbind(varPGS,zero),rbind(zero2,MZVc)),name="MZ_covar") #this is between person
+totDZV<-mxAlgebra(expression=cbind(rbind(0.5%x%varPGS,zero),rbind(zero2,DZVc)),name="DZ_covar")
+
+# Generate Covariance of Latent factor model Including Causal Paths between factors
+Id3		<-mxMatrix(type="Iden",	nrow=nfact, ncol=nfact, name="I3" )
+
+covFV	<-mxAlgebra( expression= solve(I3-PhC) %&% total_var, name ="FV") 
+covMZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% MZ_covar, name ="MZFV") 
+covDZFV	<-mxAlgebra( expression= solve(I3-PhC) %&% DZ_covar, name ="DZFV") 
+
+
+# Constraint on total variance of Ordinal variable (A+C+E=1)
+varL		<- mxConstraint( expression=FV[3,3]==1, name="L" ) #total variablity after taking into account for causal effects
+
+# Var-Cov of measured vars in terms of latent factors and AC, Cc, and Ec
+#this results in a 6x6 matrix
+
+covMZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, MZFV), cbind(MZFV, FV) )) , name="expCovMZ" )#This traces the path from vars to factors and back to vars
+covDZ	<-mxAlgebra( expression= (FactLTw  %&% rbind ( cbind(FV, DZFV), cbind(DZFV, FV) )) , name="expCovDZ" )
+
+
+# Algebra to compute standardized variance components
+#generate a 2x2 matrix which has taken into account for causal effects from FV:
+Var2by2<-mxAlgebra(expression=FV[2:3,2:3],name="FV2by2")
+StA	<- mxAlgebra( expression=Ac/FV2by2, name="h2")
+StC	<- mxAlgebra( expression=Cc/FV2by2, name="c2")
+StE	<- mxAlgebra( expression=Ec/FV2by2, name="e2")
+
+# # Algebra to compute Phenotypic, A, C & E correlations for exposure and outcome
+matI	<- mxMatrix( type="Iden", nrow=nv-1, ncol=nv-1, name="I2")
+rph	<- mxAlgebra( expression= solve(sqrt(I3*FV)) %*% FV %*% solve(sqrt(I3*FV)), name="Rph")#get overall Rph
+rAc	<- mxAlgebra( expression= solve(sqrt(I2*Ac)) %*% Ac %*% solve(sqrt(I2*Ac)), name="Rac" )
+
+
+# Algebra to get standardised b1, b2 and g1 paths:
+beta1=mxAlgebra(expression= (PhC[2,1]*sqrt(FV[1,1]))/(sqrt(FV[2,2])), name="stB1")
+beta2=mxAlgebra(expression= (PhC[3,2]*sqrt(FV[2,2]))/(sqrt(FV[3,3])), name="stG1")
+pleio=mxAlgebra(expression= (PhC[3,1]*sqrt(FV[1,1]))/(sqrt(FV[3,3])), name="stB2")
+
+
+#algebra to get RPh due to A,C,E and causal effects: 
+RphACE<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                   #(sqrt(c2[1,1])*Rcc[2,1]*sqrt(c2[2,2])),
+                                   #(sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), #this should be zero because re will be fixed to zero.
+                                   stB2*stB1, stG1),name="ACErph")
+
+# Data objects for Multiple Groups
+dataMZ	<- mxData( observed=mzdata, type="raw" )
+dataDZ	<- mxData( observed=dzdata, type="raw" )
+
+
+# Objective objects for Multiple Groups
+objMZ		<- mxExpectationNormal( covariance="expCovMZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("SSH1","SSH2") )
+objDZ		<- mxExpectationNormal( covariance="expCovDZ", means="ExpMean", dimnames=selVars, thresholds="ExpThres", threshnames=c("SSH1","SSH2") )
+
+fitFunction <- mxFitFunctionML()
+
+# Combine Groups
+
+pars<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+           covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+           StA,StC,StE,matI,rph,rAc,beta1,beta2,pleio,Var2by2,RphACE)
+
+modelMZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ" )
+modelDZ	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                  pars, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ" )
+
+
+minus2ll	<-mxAlgebra( expression=MZ.objective + DZ.objective, name="m2LL" )
+obj		<-mxFitFunctionAlgebra( "m2LL" )
+
+ACEModel	<-mxModel("ACE", pars, modelMZ, modelDZ, minus2ll, obj)
+
+#### run the ACE model which already has the parameters set or constrained: 
+ACEFit		<-mxTryHardOrdinal(ACEModel, intervals=F)
+(ACESum	<- summary(ACEFit))
+mxEval(MZ.ExpMean,ACEFit)
+
+tableMZ<-as.table(mxEval(MZ.expCovMZ,ACEFit))
+colnames(tableMZ)<-c("PGS1","pMFQ1","SSH1","PGS2","pMFQ2","SSH2")
+rownames(tableMZ)<-c("PGS1","pMFQ1","SSH1","PGS2","pMFQ2","SSH2")
+round(tableMZ,3)
+
+tableDZ<-as.table(mxEval(DZ.expCovDZ,ACEFit))
+colnames(tableDZ)<-c("PGS1","pMFQ1","SSH1","PGS2","pMFQ2","SSH2")
+rownames(tableDZ)<-c("PGS1","pMFQ1","SSH1","PGS2","pMFQ2","SSH2")
+round(tableDZ,3)
+
+mxEval(MZ.stB1,ACEFit)
+
+pathsCI1	<-mxCI (c ('MZ.stB1','MZ.stG1','MZ.stB2'))
+pathsCI2<-mxCI(c('MZ.h2[1,1]','MZ.c2[1,1]','MZ.e2[1,1]',
+                 'MZ.h2[2,2]','MZ.e2[2,2]'))
+pathsCI3<-mxCI(c('MZ.Rac[2,1]','MZ.Rph[3,2]',
+                 'MZ.ACErph[1,1]','MZ.ACErph[1,2]','MZ.ACErph[1,3]'))
+
+#CI1
+ACEModel1<-mxModel(ACEFit,pathsCI1)
+ACEFit1<-mxRun(ACEModel1,intervals=T)
+(ACESum1	<- summary(ACEFit1))
+
+#CI2
+ACEModel2<-mxModel(ACEFit,pathsCI2)
+ACEFit2<-mxRun(ACEModel2,intervals=T)
+(ACESum2	<- summary(ACEFit2))
+
+#CI3
+ACEModel3<-mxModel(ACEFit,pathsCI3)
+ACEFit3<-mxRun(ACEModel3,intervals=T)
+(ACESum3	<- summary(ACEFit3))
+
+
+sum(mxEval(MZ.ACErph[1:3],ACEFit))
+
+ACESum1$CI
+ACESum2$CI
+ACESum3$CI
+
+
+##### create full bivariate model without direction of causation for comparison #####
+## re = True, stG1= False
+FullBiMod<-mxModel(ACEFit,name="Full_Bi")
+FullBiMod<-omxSetParameters(FullBiMod, labels=c("Exy","X_to_Y"), free=c(T,F),values=c(0.5,0))
+FullBiFit<-mxRun(FullBiMod, intervals=F)
+(FullBiSum<-summary(FullBiFit,verbose=T))
+#check re
+Ec<-mxEval(MZ.Ec,FullBiFit)
+Itwo<-mxEval(MZ.I2,FullBiFit)
+(Rec<-solve(sqrt(Itwo*Ec)) %*% Ec %*% solve(sqrt(Itwo*Ec)))
+
+#check G1 (the causal effect)
+mxEval(MZ.stG1,FullBiFit)
+
+#other values
+mxEval(MZ.stB1,FullBiFit)
+mxEval(MZ.stB2,FullBiFit)
+mxEval(MZ.h2,FullBiFit);mxEval(MZ.c2,FullBiFit);mxEval(MZ.e2,FullBiFit)
+mxEval(MZ.Rac,FullBiFit)
+mxEval(MZ.Rph,FullBiFit)
+
+#get Rcc
+Cc<-mxEval(MZ.Cc,FullBiFit)
+(Rcc<-solve(sqrt(Itwo*Cc)) %*% Cc %*% solve(sqrt(Itwo*Cc)))
+# compare the two models
+mxCompare(FullBiFit,ACEFit)
+
+## now run model without effect of PRS only but still with stb2 and rc,re dropped ###
+DoC_Mod<-mxModel(ACEFit,name="DOC")
+DoC_Mod<-omxSetParameters(DoC_Mod, labels=c("PGS_to_X","PGS_to_Y"), free=c(F,F),values=c(0,0))
+DoC_Fit<-mxRun(DoC_Mod, intervals=F)
+(DoCSum<-summary(DoC_Fit,verbose=T))
+
+#check PGS effect
+mxEval(MZ.stB1,DoC_Fit);mxEval(MZ.stB2,DoC_Fit)
+#values for the path diagram
+mxEval(MZ.stG1,DoC_Fit)
+mxEval(MZ.h2,DoC_Fit);mxEval(MZ.c2,DoC_Fit);mxEval(MZ.e2,DoC_Fit)
+mxEval(MZ.Rac,DoC_Fit)
+mxEval(MZ.Rph,DoC_Fit)
+mxEval(MZ.expCovMZ,DoC_Fit);mxEval(DZ.expCovDZ,DoC_Fit)
+#compare the models
+mxCompare(ACEFit,DoC_Fit)
+
+
+##### sensitivity analysis: what if rE is not zero, e.g. fixed to 0.20? #####
+#add re into the model
+rEc	<- mxAlgebra( expression= solve(sqrt(I2*Ec)) %*% Ec %*% solve(sqrt(I2*Ec)), name="Rec" )
+RphACE2<-mxAlgebra(expression=cbind((sqrt(h2[1,1])*Rac[2,1]*sqrt(h2[2,2])),
+                                    #(sqrt(c2[1,1])*Rcc[2,1]*sqrt(c2[2,2])),
+                                    (sqrt(e2[1,1])*Rec[2,1]*sqrt(e2[2,2])), 
+                                    stB2*stB1, stb2),name="ACErph2")
+pars2<-list(Load,Id2,LoadTw,PhCaus,PathsAc,PathsCc,PathsEc,
+            covAc,covCc,covEc,covPc, Id3,zeromat,zeromat2, PGSvar,PGSpath,totV,covFV,
+            StA,StC,StE,matI,rph,rAc,rEc,beta1,beta2,pleio,Var2by2,RphACE2)
+
+modelMZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, MZcovPc,totMZV,covMZFV,covMZ, dataMZ, objMZ, fitFunction, varL, name="MZ2" )
+modelDZ2	<-mxModel(obsAge1,obsAge2,obsSex1,obsSex2,betaA,betaS,Tr,inc,Thres,Mean,
+                   pars2, DZcovPc,totDZV,covDZFV,covDZ,dataDZ, objDZ, fitFunction, name="DZ2" )
+minus2ll2	<-mxAlgebra( expression=MZ2.objective + DZ2.objective, name="m2LL2" )
+obj2		<-mxFitFunctionAlgebra( "m2LL2" )
+rE_fixed_Model	<-mxModel("rE_fixed", pars2, modelMZ2, modelDZ2, minus2ll2, obj2)
+rE_fixed_Model <-omxSetParameters(rE_fixed_Model, labels=c("Exy", "X_to_Y"), free=c(T,T),values=c(0.5,0.2))
+
+pathsCI_rEfix	<-mxCI (c ('MZ2.stG1'))
+#re = 0.05
+rE_fixed_Model005<-mxModel(rE_fixed_Model,name="rE_fixed",
+                           mxConstraint(MZ2.Rec[1,2]==0.05, name="con1"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit1		<- mxTryHardOrdinal(rE_fixed_Model005, intervals = T)
+
+(rE_Fixed_FitSumm1<-summary(rE_Fixed_Fit1,verbose=T))
+mxEval(MZ2.stG1,rE_Fixed_Fit1)
+mxEval(MZ2.Rec,rE_Fixed_Fit1)
+
+## re=0.10
+rE_fixed_Model010<-mxModel(rE_fixed_Model,name="rE_fixed2",
+                           mxConstraint(MZ2.Rec[1,2]==0.10, name="con2"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit2		<- mxTryHardOrdinal(rE_fixed_Model010, intervals = T)
+
+(rE_Fixed_FitSumm2<-summary(rE_Fixed_Fit2,verbose=T))
+
+## re=0.15
+rE_fixed_Model015<-mxModel(rE_fixed_Model,name="rE_fixed3",
+                           mxConstraint(MZ2.Rec[1,2]==0.15, name="con3"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit3		<- mxTryHardOrdinal(rE_fixed_Model015, intervals = T)
+
+(rE_Fixed_FitSumm3<-summary(rE_Fixed_Fit3,verbose=T))
+
+## re=0.20
+rE_fixed_Model020<-mxModel(rE_fixed_Model,name="rE_fixed4",
+                           mxConstraint(MZ2.Rec[1,2]==0.20, name="con4"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit4		<- mxTryHardOrdinal(rE_fixed_Model020, intervals = T)
+
+(rE_Fixed_FitSumm4<-summary(rE_Fixed_Fit4,verbose=T))
+
+## re=0.25
+rE_fixed_Model025<-mxModel(rE_fixed_Model,name="rE_fixed5",
+                           mxConstraint(MZ2.Rec[1,2]==0.25, name="con5"),
+                           pathsCI_rEfix)
+
+rE_Fixed_Fit5		<- mxTryHardOrdinal(rE_fixed_Model025, intervals = T,extraTries=20)
+
+(rE_Fixed_FitSumm5<-summary(rE_Fixed_Fit5,verbose=T))
+
+
+rbind(mxCompare(ACEFit1,rE_Fixed_Fit1),
+      mxCompare(ACEFit1,rE_Fixed_Fit2)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit3)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit4)[2,],
+      mxCompare(ACEFit1,rE_Fixed_Fit5)[2,])
+
+rbind(mxEval(MZ2.stG1,rE_Fixed_Fit1),
+      mxEval(MZ2.stG1,rE_Fixed_Fit2),
+      mxEval(MZ2.stG1,rE_Fixed_Fit3),
+      mxEval(MZ2.stG1,rE_Fixed_Fit4),
+      mxEval(MZ2.stG1,rE_Fixed_Fit5))
+
+rbind(ACESum1$CI[2,],
+      rE_Fixed_FitSumm1$CI,
+      rE_Fixed_FitSumm2$CI,
+      rE_Fixed_FitSumm3$CI,
+      rE_Fixed_FitSumm4$CI,
+      rE_Fixed_FitSumm5$CI)
+## save the results as RData
+save.image("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv5_pMFQ_SSH_20_April_2021.RData")
+load("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_rc_re_zero_wSAv2_pMFQ_SSH_25_March_2021.RData")
+
+```
+
+
+## Extracting MR-DoC results into Excel sheets
+The code chunk below was used to extract MR-DoC modelling results from Rdata format into Excel sheets. The results on Excel sheets were then manually arranged to have a more readable format.
+```{r excel, eval=FALSE}
+rm(list=ls())
+setwd("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/results")
+one_SH<-grep("MR_DoC_rc_re_zero_wSAv5_",list.files())
+(names<-list.files()[c(one_SH)]) #Rdata files to be loaded. 
+
+names[1]
+load(names[1]) #load cMFQ NSSH
+#use data from Model 2 in this cMFQ-NSSH Rdata: residualise CMFQ then transform. 
+cMFQ_NSSH<-rbind(ACESum1$CI,ACESum2$CI,ACESum3$CI)
+cMFQ_NSSH$exposure<-"cMFQ"
+cMFQ_NSSH$outcome<-"NSSH"
+
+cMFQ_NSSH_bi_compare<-as.data.frame(mxCompare(FullBiFit,ACEFit))
+cMFQ_NSSH_bi_compare$exposure<-"cMFQ"
+cMFQ_NSSH_bi_compare$outcome<-"NSSH"
+cMFQ_NSSH_bi_compare$rE<-c(Rec[1,2])
+
+cMFQ_NSSH_DoC<-as.data.frame(mxCompare(ACEFit,DoC_Fit))
+cMFQ_NSSH_DoC$exposure<-"cMFQ"
+cMFQ_NSSH_DoC$outcome<-"NSSH"
+
+names[2]
+load(names[2]) #load cMFQ SSH
+cMFQ_SSH<-rbind(ACESum1$CI,ACESum2$CI,ACESum3$CI)
+cMFQ_SSH$exposure<-"cMFQ"
+cMFQ_SSH$outcome<-"SSH"
+cMFQ_SSH_bi_compare$rE<-c(Rec[1,2])
+
+cMFQ_SSH_bi_compare<-as.data.frame(mxCompare(FullBiFit,ACEFit))
+cMFQ_SSH_bi_compare$exposure<-"cMFQ"
+cMFQ_SSH_bi_compare$outcome<-"SSH"
+
+cMFQ_SSH_DoC<-as.data.frame(mxCompare(ACEFit,DoC_Fit))
+cMFQ_SSH_DoC$exposure<-"cMFQ"
+cMFQ_SSH_DoC$outcome<-"SSH"
+
+names[5]
+load(names[5]) #load pMFQ NSSH
+pMFQ_NSSH<-rbind(ACESum1$CI,ACESum2$CI,ACESum3$CI)
+pMFQ_NSSH$exposure<-"pMFQ"
+pMFQ_NSSH$outcome<-"NSSH"
+
+pMFQ_NSSH_bi_compare<-as.data.frame(mxCompare(FullBiFit,ACEFit))
+pMFQ_NSSH_bi_compare$exposure<-"pMFQ"
+pMFQ_NSSH_bi_compare$outcome<-"NSSH"
+pMFQ_NSSH_bi_compare$rE<-c(Rec[1,2])
+
+
+pMFQ_NSSH_DoC<-as.data.frame(mxCompare(ACEFit,DoC_Fit))
+pMFQ_NSSH_DoC$exposure<-"pMFQ"
+pMFQ_NSSH_DoC$outcome<-"NSSH"
+
+names[6]
+load(names[6]) #load pMFQ SSH
+pMFQ_SSH<-rbind(ACESum1$CI,ACESum2$CI,ACESum3$CI)
+pMFQ_SSH$exposure<-"pMFQ"
+pMFQ_SSH$outcome<-"SSH"
+
+pMFQ_SSH_bi_compare<-as.data.frame(mxCompare(FullBiFit,ACEFit))
+pMFQ_SSH_bi_compare$exposure<-"pMFQ"
+pMFQ_SSH_bi_compare$outcome<-"SSH"
+pMFQ_SSH_bi_compare$rE<-c(Rec[1,2])
+
+pMFQ_SSH_DoC<-as.data.frame(mxCompare(ACEFit,DoC_Fit))
+pMFQ_SSH_DoC$exposure<-"pMFQ"
+pMFQ_SSH_DoC$outcome<-"SSH"
+
+names[3]
+load(names[3]) #load pCONN NSSH
+pCONN_NSSH<-rbind(ACESum1$CI,ACESum2$CI,ACESum3$CI)
+pCONN_NSSH$exposure<-"pCONN"
+pCONN_NSSH$outcome<-"NSSH"
+
+pCONN_NSSH_bi_compare<-as.data.frame(mxCompare(FullBiFit,ACEFit))
+pCONN_NSSH_bi_compare$exposure<-"pCONN"
+pCONN_NSSH_bi_compare$outcome<-"NSSH"
+pCONN_NSSH_bi_compare$rE<-c(Rec[1,2])
+
+pCONN_NSSH_DoC<-as.data.frame(mxCompare(ACEFit,DoC_Fit))
+pCONN_NSSH_DoC$exposure<-"pCONN"
+pCONN_NSSH_DoC$outcome<-"NSSH"
+
+
+names[4]
+load(names[4]) #load pCONN SSH
+#load Model 1. 
+pCONN_SSH<-rbind(ACESum1$CI,ACESum2$CI,ACESum3$CI)
+pCONN_SSH$exposure<-"pCONN"
+pCONN_SSH$outcome<-"SSH"
+
+pCONN_SSH_bi_compare<-as.data.frame(mxCompare(FullBiFit,ACEFit))
+pCONN_SSH_bi_compare$exposure<-"pCONN"
+pCONN_SSH_bi_compare$outcome<-"SSH"
+pCONN_SSH_bi_compare$rE<-c(Rec[1,2])
+
+pCONN_SSH_DoC<-as.data.frame(mxCompare(ACEFit,DoC_Fit))
+pCONN_SSH_DoC$exposure<-"pCONN"
+pCONN_SSH_DoC$outcome<-"SSH"
+
+
+## IMPORTANT: make sure g1 in the labels refer to the causal effect etc, following Minica's paper
+whole_data<-rbind(cMFQ_NSSH,cMFQ_SSH,pMFQ_NSSH,pMFQ_SSH,pCONN_NSSH,pCONN_SSH)
+labels<-c("b1","g1","b2","X_h2","X_c2","X_e2","Y_h2","Y_e2","Ra","Rph","RphA","RPh_PRS","RPh_Cause")
+rownames(whole_data)<-
+  c(paste0(labels,c(rep("_cMFQ_NSSH",13))),
+  paste0(labels,c(rep("_cMFQ_SSH",13))),
+  paste0(labels,c(rep("_pMFQ_NSSH",13))),
+  paste0(labels,c(rep("_pMFQ_SSH",13))),
+  paste0(labels,c(rep("_pCONN_NSSH",13))),
+  paste0(labels,c(rep("_pCONN_SSH",13))))
+
+whole_data
+library(tidyverse)
+whole_data2<-
+  whole_data%>%
+  select(5,6,1,2,3)%>%
+  mutate_at(vars(-c(exposure,outcome)),funs(round(.,3)))%>%
+  add_column(names=rep(c("b1","g1","b2","X_h2","X_c2","X_e2","Y_h2","Y_e2","Ra","Rph","RPh_A","RPh_PRS","RPh_Cau"),6))%>%
+  select(6,1:5)
+
+whole_data2
+
+b1b2g1<-subset(whole_data2,
+               whole_data2$names=="b1"|whole_data2$names=="b2"|whole_data2$names=="g1")
+b1b2g1
+
+b1b2g1_wide<-b1b2g1%>%
+          add_column(estimate_CI=paste0(format(b1b2g1$estimate,digits=3), " (", 
+                           format(b1b2g1$lbound,digits=3), ",", 
+                           format(b1b2g1$ubound,digits=3), ")"))%>%
+          select(c(1:3,7))%>%
+          spread(names, estimate_CI)%>%
+          select(c(1,2,3,5,4))
+
+b1b2g1_wide
+##h2c2e2
+h2c2e2<-subset(whole_data2,
+               whole_data2$names=="X_h2"|whole_data2$names=="X_c2"|whole_data2$names=="X_e2"|
+               whole_data2$names=="Y_h2"|whole_data2$names=="Y_c2"|whole_data2$names=="Y_e2")
+
+h2c2e2_wide<-h2c2e2%>%
+  add_column(estimate_CI=paste0(format(h2c2e2$estimate,digits=3), " (", 
+                                format(h2c2e2$lbound,digits=3), ",", 
+                                format(h2c2e2$ubound,digits=3), ")"))%>%
+  select(1:3,7)%>%
+  spread(names,estimate_CI)%>%
+  select(1,2,5,3,4,7,6)
+  
+h2c2e2_wide
+
+rarcrph<-subset(whole_data2,
+               whole_data2$names=="Ra"|whole_data2$names=="Rc"|whole_data2$names=="Rph")
+rarcrph
+rarcrph_wide<-rarcrph%>%
+  add_column(estimate_CI=paste0(format(rarcrph$estimate,digits=3), " (", 
+                                format(rarcrph$lbound,digits=3), ",", 
+                                format(rarcrph$ubound,digits=3), ")"))%>%
+  select(1:3,7)%>%
+  spread(names,estimate_CI)
+
+rarcrph_wide
+
+rphACC<-subset(whole_data2,
+                whole_data2$names=="RPh_A"|whole_data2$names=="RPh_C"|whole_data2$names=="RPh_PRS"|whole_data2$names=="RPh_Cau")
+rphACC
+rphACC_wide<-rphACC%>%
+  add_column(estimate_CI=paste0(format(rphACC$estimate,digits=3), " (", 
+                                format(rphACC$lbound,digits=3), ",", 
+                                format(rphACC$ubound,digits=3), ")"))%>%
+  select(1:3,7)%>%
+  spread(names,estimate_CI)
+rphACC_wide
+
+# merge rphACC_wide and b1b2g2_wide
+merged_estimates<-
+  merge(merge(b1b2g1_wide,rphACC_wide, by=c("exposure", "outcome")),
+        rarcrph_wide,by=c("exposure", "outcome"))%>%
+  select(1,2,3,4,5,10,6,7,8)
+
+  colnames(merged_estimates)<-
+    c("Exposure","Outcome","b1", "g1 (causal effect)",
+      "b2 (pleiotropy)", "RPh", "RPh due to A", 
+      "RPh due to causal effect","RPh due to pleiotropy")
+
+merged_estimates
+
+## now collect data from bi_compare and DoC
+bi_compare<-rbind(cMFQ_NSSH_bi_compare,cMFQ_SSH_bi_compare,
+                  pMFQ_NSSH_bi_compare,pMFQ_SSH_bi_compare,
+                  pCONN_NSSH_bi_compare,pCONN_SSH_bi_compare)%>%
+  select(14,15,1:9,16)
+bi_compare
+
+DoC<-rbind(cMFQ_NSSH_DoC,cMFQ_SSH_DoC,
+           pMFQ_NSSH_DoC,pMFQ_SSH_DoC,
+           pCONN_NSSH_DoC,pCONN_SSH_DoC)%>%
+  select(14,15,1:9)
+
+
+xlsx::write.xlsx(whole_data2,"MR_DoC_results_27_April_2021.xlsx",sheetName = "whole_data")
+xlsx::write.xlsx(b1b2g1_wide,"MR_DoC_results_27_April_2021.xlsx",sheetName = "causal_effects",append = T)
+xlsx::write.xlsx(h2c2e2_wide,"MR_DoC_results_27_April_2021.xlsx",sheetName = "h2_c2_e2",append = T)
+xlsx::write.xlsx(rarcrph_wide,"MR_DoC_results_27_April_2021.xlsx",sheetName = "Ra_Rc_Rph",append = T)
+xlsx::write.xlsx(rphACC_wide,"MR_DoC_results_27_April_2021.xlsx",sheetName = "Rph_ACC",append = T)
+xlsx::write.xlsx(whole_data,"MR_DoC_results_27_April_2021.xlsx",sheetName = "raw_data",append = T)
+xlsx::write.xlsx(merged_estimates,"MR_DoC_results_27_April_2021.xlsx",sheetName = "table_for_paper",append = T)
+## add bi_compare, DoC, ext MR
+xlsx::write.xlsx(bi_compare,"MR_DoC_results_27_April_2021.xlsx",sheetName = "compare with full bi model",append = T)
+xlsx::write.xlsx(DoC,"MR_DoC_results_27_April_2021.xlsx",sheetName = "compare with DoC model (no PGS)",append = T)
+
+
+
+
+##### fixed rE results ####
+fixed_confint<-grep("MR_DoC_rc_re_zero_wSAv5_",list.files())
+#zerolbound<-grep("MR_DoC_rc_re_zero_wSAv4_",list.files())
+(names_fixed_confint<-list.files()[c(fixed_confint)]) #Rdata files to be loaded. 
+(names_zerolbound<-list.files()[c(zerolbound)])
+
+#assess using confint
+#for cMFQ-NSSH
+names_fixed_confint[1]
+load(names_fixed_confint[1]) #load cMFQ NSSH
+AIC_cMFQ_NSSH<-rbind(as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit1)),
+      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit2))[2,],
+      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit3))[2,],
+      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit4))[2,],
+      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit5))[2,])[,6]
+
+
+
+confint_cMFQ_NSSH<-rbind(
+      ACESum1$CI[2,],
+      rE_Fixed_FitSumm1$CI,
+      rE_Fixed_FitSumm2$CI,
+      rE_Fixed_FitSumm3$CI,
+      rE_Fixed_FitSumm4$CI,
+      rE_Fixed_FitSumm5$CI)
+
+rE_values<-c(seq(from=0, to=0.25,by=0.05))
+fixed_rE_cMFQ_NSSH_CI<-cbind(rE_values,AIC_cMFQ_NSSH,confint_cMFQ_NSSH)
+
+
+
+
+#for cMFQ-SSH
+names_fixed_confint[2]
+load(names_fixed_confint[2]) #load cMFQ NSSH
+AIC_cMFQ_SSH<-rbind(as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit1)),
+                     as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit2))[2,],
+                     as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit3))[2,],
+                     as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit4))[2,],
+                     as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit5))[2,])[,6]
+
+
+
+confint_cMFQ_SSH<-rbind(
+  ACESum1$CI[2,],
+  rE_Fixed_FitSumm1$CI,
+  rE_Fixed_FitSumm2$CI,
+  rE_Fixed_FitSumm3$CI,
+  rE_Fixed_FitSumm4$CI,
+  rE_Fixed_FitSumm5$CI)
+
+rE_values<-c(seq(from=0, to=0.25,by=0.05))
+fixed_rE_cMFQ_SSH_CI<-cbind(rE_values,AIC_cMFQ_SSH,confint_cMFQ_SSH)
+
+#for pCONN-NSSH
+names_fixed_confint[3]
+load(names_fixed_confint[3]) #load cMFQ NSSH
+AIC_pCONN_NSSH<-rbind(as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit1)),
+                    as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit2))[2,],
+                    as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit3))[2,],
+                    as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit4))[2,],
+                    as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit5))[2,])[,6]
+
+
+
+confint_pCONN_NSSH<-rbind(
+  ACESum1$CI[2,],
+  rE_Fixed_FitSumm1$CI,
+  rE_Fixed_FitSumm2$CI,
+  rE_Fixed_FitSumm3$CI,
+  rE_Fixed_FitSumm4$CI,
+  rE_Fixed_FitSumm5$CI)
+
+rE_values<-c(seq(from=0, to=0.25,by=0.05))
+fixed_rE_pCONN_NSSH_CI<-cbind(rE_values,AIC_pCONN_NSSH,confint_pCONN_NSSH)
+
+
+#for pCONN-SSH
+names_fixed_confint[4]
+load(names_fixed_confint[4]) #load cMFQ NSSH
+AIC_pCONN_SSH<-rbind(as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit1)),
+                      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit2))[2,],
+                      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit3))[2,],
+                      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit4))[2,],
+                      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit5))[2,])[,6]
+
+
+
+confint_pCONN_SSH<-rbind(
+  ACESum1$CI[2,],
+  rE_Fixed_FitSumm1$CI,
+  rE_Fixed_FitSumm2$CI,
+  rE_Fixed_FitSumm3$CI,
+  rE_Fixed_FitSumm4$CI,
+  rE_Fixed_FitSumm5$CI)
+
+rE_values<-c(seq(from=0, to=0.25,by=0.05))
+fixed_rE_pCONN_SSH_CI<-cbind(rE_values,AIC_pCONN_SSH,confint_pCONN_SSH)
+
+
+#for pMFQ-NSSH
+names_fixed_confint[5]
+load(names_fixed_confint[5]) #load pMFQ NSSH
+AIC_pMFQ_NSSH<-rbind(as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit1)),
+                      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit2))[2,],
+                      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit3))[2,],
+                      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit4))[2,],
+                      as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit5))[2,])[,6]
+
+
+
+confint_pMFQ_NSSH<-rbind(
+  ACESum1$CI[2,],
+  rE_Fixed_FitSumm1$CI,
+  rE_Fixed_FitSumm2$CI,
+  rE_Fixed_FitSumm3$CI,
+  rE_Fixed_FitSumm4$CI,
+  rE_Fixed_FitSumm5$CI)
+
+rE_values<-c(seq(from=0, to=0.25,by=0.05))
+fixed_rE_pMFQ_NSSH_CI<-cbind(rE_values,AIC_pMFQ_NSSH,confint_pMFQ_NSSH)
+
+
+#pMFQ-SSH
+names_fixed_confint[6]
+load(names_fixed_confint[6]) #load pMFQ SSH
+AIC_pMFQ_SSH<-rbind(as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit1)),
+                     as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit2))[2,],
+                     as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit3))[2,],
+                     as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit4))[2,],
+                     as.data.frame(mxCompare(ACEFit1,rE_Fixed_Fit5))[2,])[,6]
+
+
+
+confint_pMFQ_SSH<-rbind(
+  ACESum1$CI[2,],
+  rE_Fixed_FitSumm1$CI,
+  rE_Fixed_FitSumm2$CI,
+  rE_Fixed_FitSumm3$CI,
+  rE_Fixed_FitSumm4$CI,
+  rE_Fixed_FitSumm5$CI)
+
+rE_values<-c(seq(from=0, to=0.25,by=0.05))
+fixed_rE_pMFQ_SSH_CI<-cbind(rE_values,AIC_pMFQ_SSH,confint_pMFQ_SSH)
+
+
+fixed_rE_cMFQ_NSSH_CI$ID<-"cMFQ_NSSH"
+fixed_rE_cMFQ_SSH_CI$ID<-"cMFQ_SSH"
+fixed_rE_pMFQ_NSSH_CI$ID<-"pMFQ_NSSH"
+fixed_rE_pMFQ_SSH_CI$ID<-"pMFQ_SSH"
+fixed_rE_pCONN_NSSH_CI$ID<-"pCONN_NSSH"
+fixed_rE_pCONN_SSH_CI$ID<-"pCONN_SSH"
+
+colnames(fixed_rE_cMFQ_NSSH_CI)[2]<-"AIC"
+colnames(fixed_rE_cMFQ_SSH_CI)[2]<-"AIC"
+colnames(fixed_rE_pMFQ_NSSH_CI)[2]<-"AIC"
+colnames(fixed_rE_pMFQ_SSH_CI)[2]<-"AIC"
+colnames(fixed_rE_pCONN_NSSH_CI)[2]<-"AIC"
+colnames(fixed_rE_pCONN_SSH_CI)[2]<-"AIC"
+
+fixed_rE_data<-rbind(fixed_rE_cMFQ_NSSH_CI,
+                     fixed_rE_cMFQ_SSH_CI,
+                     fixed_rE_pMFQ_NSSH_CI,
+                     fixed_rE_pMFQ_SSH_CI,
+                     fixed_rE_pCONN_NSSH_CI,
+                     fixed_rE_pCONN_SSH_CI)
+fixed_rE_data2<-fixed_rE_data%>%
+  add_column(estimate_CI=paste0(format(fixed_rE_data$estimate,digits=1), " (", 
+                                format(fixed_rE_data$lbound,digits=1), ",", 
+                                round(fixed_rE_data$ubound,digits=3), ")"))%>%
+  select(7,1,2,8)
+
+
+
+xlsx::write.xlsx(fixed_rE_data2,"MR_DoC_results_27_April_2021.xlsx",sheetName = "fixed_rE_data2",append = T)
+
+```
+
+## MR-DoC Results
+```{r show-mr-doc-results}
+MR_doc_results=xlsx::read.xlsx("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_results_27_April_2021.xlsx", sheetName = "table_for_paper")
+
+MR_doc_results$Exposure<-c("cMFQ","cMFQ","pCONN","pCONN","pMFQ","pMFQ")
+MR_doc_results=MR_doc_results[,-1]
+kableExtra::kable(MR_doc_results,digits=3,align="c")%>%
+  kableExtra::kable_styling(font_size = 12, full_width = TRUE)%>%
+  collapse_rows()
+
+```
+
+## Sensitivity analyses
+
+Scripts for sensitivity analyses are part of the model scripts above. This section will only show results from sensitivity analyses. 
+
+```{r sensivity-analyses}
+options(knitr.kable.NA = '')
+SA_results=xlsx::read.xlsx("/Users/kai/OneDrive - King's College London/PhD/MR_DOC/Results/MR_DoC_results_27_April_2021.xlsx", sheetName = "fixed_rE_data2")
+
+kableExtra::kable(SA_results,digits=3,align="c")%>%
+  kableExtra::kable_styling(font_size = 12, full_width = TRUE)%>%
+  collapse_rows()
+```
+
